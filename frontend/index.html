@@ -1,0 +1,1387 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>LLMlifeline</title>
+<style>
+  :root {
+    --bg: #1e1e1e;
+    --panel: #252526;
+    --border: #3a3a3a;
+    --text: #e0e0e0;
+    --muted: #9a9a9a;
+    --accent: #4a8cff;
+    --user-bubble: #2b3f5c;
+    --assistant-bubble: #2d2d2d;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    font-family: -apple-system, Segoe UI, Roboto, sans-serif;
+    background: var(--bg);
+    color: var(--text);
+    height: 100vh;
+    display: flex;
+  }
+
+  /* ---- Sidebar: projects ---- */
+  #sidebar {
+    width: 260px;
+    flex-shrink: 0;
+    background: var(--panel);
+    border-right: 1px solid var(--border);
+    display: flex;
+    flex-direction: column;
+    padding: 12px;
+  }
+  #sidebar h2 {
+    font-size: 13px;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    color: var(--muted);
+    margin: 4px 0 12px;
+  }
+  #new-project-btn {
+    background: var(--accent);
+    color: white;
+    border: none;
+    border-radius: 6px;
+    padding: 8px 10px;
+    font-size: 13px;
+    cursor: pointer;
+    margin-bottom: 12px;
+  }
+  #new-project-btn:hover { opacity: 0.9; }
+  #project-list {
+    overflow-y: auto;
+    flex: 1 1 auto;
+    min-height: 80px;
+  }
+  .project-item {
+    padding: 10px;
+    border-radius: 6px;
+    cursor: pointer;
+    margin-bottom: 4px;
+    font-size: 14px;
+  }
+  .project-item:hover { background: #2f2f30; }
+  .project-item.active { background: #3a4d6e; }
+  .project-item .conv-count {
+    display: block;
+    font-size: 11px;
+    color: var(--muted);
+    margin-top: 2px;
+  }
+
+  /* ---- Sidebar: conversation picker (per selected project) ---- */
+  #conversation-section {
+    flex-shrink: 0;
+    border-top: 1px solid var(--border);
+    margin-top: 8px;
+    padding-top: 8px;
+  }
+  #conversation-controls {
+    display: flex;
+    gap: 6px;
+  }
+  #conversation-select {
+    flex: 1;
+    min-width: 0;
+    background: #2f2f30;
+    color: var(--text);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 6px 8px;
+    font-size: 13px;
+  }
+  #delete-conversation-btn {
+    background: transparent;
+    color: #9a9a9a;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 0 10px;
+    font-size: 14px;
+    cursor: pointer;
+    flex-shrink: 0;
+  }
+  #delete-conversation-btn:hover { color: #e08080; border-color: #5a3535; }
+  #delete-conversation-btn:disabled, #conversation-select:disabled { opacity: 0.4; cursor: not-allowed; }
+
+  /* ---- Sidebar: project images (bottom section) ---- */
+  #image-gallery-section {
+    flex: 1 1 auto;
+    min-height: 140px;
+    display: flex;
+    flex-direction: column;
+    border-top: 1px solid var(--border);
+    margin-top: 8px;
+    padding-top: 8px;
+  }
+  #image-gallery {
+    overflow-y: auto;
+    display: grid;
+    grid-template-columns: repeat(3, 1fr);
+    gap: 6px;
+    align-content: start;
+  }
+  .gallery-thumb {
+    width: 100%;
+    aspect-ratio: 1;
+    object-fit: cover;
+    border-radius: 4px;
+    border: 1px solid var(--border);
+    cursor: zoom-in;
+    background: #2f2f30;
+  }
+  .gallery-thumb:hover { border-color: var(--accent); }
+  #image-gallery-empty {
+    color: var(--muted);
+    font-size: 12px;
+    grid-column: 1 / -1;
+  }
+
+  /* ---- Image lightbox ---- */
+  #lightbox-overlay {
+    display: none;
+    position: fixed; inset: 0;
+    background: rgba(0,0,0,0.88);
+    align-items: center; justify-content: center;
+    overflow: auto;
+    padding: 24px;
+    z-index: 1000;
+  }
+  #lightbox-overlay.visible { display: flex; }
+  #lightbox-img {
+    max-width: 90vw;
+    max-height: 90vh;
+    object-fit: contain;
+    border-radius: 4px;
+    cursor: zoom-in;
+  }
+  #lightbox-img.zoomed {
+    max-width: none;
+    max-height: none;
+    width: auto;
+    cursor: zoom-out;
+  }
+  #lightbox-caption {
+    position: fixed;
+    bottom: 18px; left: 50%;
+    transform: translateX(-50%);
+    color: var(--text);
+    font-size: 13px;
+    max-width: 80vw;
+    text-align: center;
+    background: rgba(0,0,0,0.6);
+    padding: 6px 14px;
+    border-radius: 6px;
+  }
+  #lightbox-close {
+    position: fixed;
+    top: 14px; right: 20px;
+    background: transparent;
+    border: none;
+    color: white;
+    font-size: 30px;
+    line-height: 1;
+    cursor: pointer;
+    z-index: 1001;
+  }
+  #lightbox-close:hover { color: var(--accent); }
+
+  /* ---- Main column ---- */
+  #main { flex: 1; display: flex; flex-direction: column; min-width: 0; }
+
+  #topbar {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    padding: 10px 16px;
+    border-bottom: 1px solid var(--border);
+    background: var(--panel);
+  }
+  #project-title { font-size: 15px; font-weight: 600; flex: 1; }
+  #model-select, #checkpoint-select {
+    background: #2f2f30;
+    color: var(--text);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 6px 8px;
+    font-size: 13px;
+  }
+  #model-select:disabled, #checkpoint-select:disabled {
+    opacity: 0.4;
+    cursor: not-allowed;
+  }
+  #mode-toggle {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    padding: 0 8px;
+    border-right: 1px solid var(--border);
+    margin-right: 4px;
+  }
+  #mode-toggle label {
+    display: flex;
+    align-items: center;
+    gap: 5px;
+    font-size: 13px;
+    color: var(--text);
+    cursor: pointer;
+    white-space: nowrap;
+  }
+  #mode-toggle input[type="checkbox"] {
+    accent-color: var(--accent);
+    cursor: pointer;
+  }
+  #mode-toggle input[type="checkbox"]:disabled,
+  #mode-toggle input[type="checkbox"]:disabled + span {
+    cursor: not-allowed;
+    opacity: 0.5;
+  }
+  #new-chat-btn {
+    background: transparent;
+    color: var(--accent);
+    border: 1px solid var(--accent);
+    border-radius: 6px;
+    padding: 6px 10px;
+    font-size: 13px;
+    cursor: pointer;
+  }
+  #restart-btn {
+    background: transparent;
+    color: #9a9a9a;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 6px 10px;
+    font-size: 13px;
+    cursor: pointer;
+  }
+  #restart-btn:hover { color: var(--text); border-color: #555; }
+  #stop-btn {
+    background: transparent;
+    color: #e08080;
+    border: 1px solid #5a3535;
+    border-radius: 6px;
+    padding: 6px 10px;
+    font-size: 13px;
+    cursor: pointer;
+  }
+  #stop-btn:hover { background: #3a2020; }
+  #extended-context-btn {
+    background: transparent;
+    color: #9a9a9a;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 6px 10px;
+    font-size: 13px;
+    cursor: pointer;
+  }
+  #extended-context-btn:hover { color: var(--text); border-color: #555; }
+  #extended-context-btn.on {
+    color: #4a8cff;
+    border-color: #4a8cff;
+    background: #1a2a42;
+  }
+  #extended-context-btn:disabled { opacity: 0.4; cursor: not-allowed; }
+  #restart-btn:disabled, #stop-btn:disabled { opacity: 0.4; cursor: not-allowed; }
+  #status-dot {
+    width: 8px; height: 8px; border-radius: 50%;
+    background: #555;
+    flex-shrink: 0;
+  }
+  #status-dot.ok { background: #4caf50; }
+  #status-dot.busy { background: #d4a017; }
+  #status-dot.bad { background: #e05252; }
+  #status-label {
+    font-size: 12px;
+    color: #9a9a9a;
+    margin-right: 4px;
+    white-space: nowrap;
+  }
+  #status-label.ok { color: #4caf50; }
+  #status-label.busy { color: #d4a017; }
+  #status-label.bad { color: #e05252; }
+
+  /* ---- Chat area ---- */
+  #chat-scroll {
+    flex: 1;
+    overflow-y: auto;
+    padding: 20px;
+    display: flex;
+    flex-direction: column;
+    gap: 14px;
+  }
+  #empty-state {
+    margin: auto;
+    text-align: center;
+    color: var(--muted);
+    font-size: 14px;
+  }
+  .msg-row { display: flex; }
+  .msg-row.user { justify-content: flex-end; }
+  .bubble {
+    max-width: 70%;
+    padding: 10px 14px;
+    border-radius: 10px;
+    font-size: 14px;
+    line-height: 1.45;
+    white-space: pre-wrap;
+    word-wrap: break-word;
+  }
+  .msg-row.user .bubble { background: var(--user-bubble); }
+  .msg-row.assistant .bubble { background: var(--assistant-bubble); }
+
+  .msg-timestamp {
+    margin-top: 4px;
+    font-size: 11px;
+    color: var(--muted);
+    opacity: 0.8;
+  }
+
+  .think-block {
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    margin-bottom: 8px;
+    font-size: 12px;
+  }
+  .think-block summary {
+    cursor: pointer;
+    padding: 6px 10px;
+    color: var(--muted);
+    user-select: none;
+  }
+  .think-block summary:hover { color: var(--text); }
+  .think-block .think-content {
+    padding: 8px 10px;
+    border-top: 1px solid var(--border);
+    color: var(--muted);
+    white-space: pre-wrap;
+  }
+
+  .generated-image {
+    display: block;
+    max-width: 100%;
+    border-radius: 6px;
+  }
+  .generated-image-caption {
+    margin-top: 6px;
+    font-size: 12px;
+    color: var(--muted);
+  }
+  .msg-row .bubble:has(.generated-image) { max-width: 400px; }
+
+  #typing-indicator {
+    display: none;
+    color: var(--muted);
+    font-size: 13px;
+    padding-left: 4px;
+  }
+  #typing-indicator.visible { display: block; }
+
+  /* ---- Composer ---- */
+  #composer {
+    display: flex;
+    gap: 10px;
+    padding: 14px 20px;
+    border-top: 1px solid var(--border);
+    background: var(--panel);
+  }
+  #composer textarea {
+    flex: 1;
+    resize: none;
+    background: #2f2f30;
+    color: var(--text);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 10px 12px;
+    font-size: 14px;
+    font-family: inherit;
+    max-height: 140px;
+  }
+  #composer button {
+    background: var(--accent);
+    color: white;
+    border: none;
+    border-radius: 8px;
+    padding: 0 18px;
+    font-size: 14px;
+    cursor: pointer;
+  }
+  #composer button:disabled { opacity: 0.5; cursor: not-allowed; }
+  #composer #upload-btn {
+    background: transparent;
+    color: #9a9a9a;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 0 14px;
+    font-size: 16px;
+    cursor: pointer;
+    flex-shrink: 0;
+  }
+  #composer #upload-btn:hover { color: var(--text); border-color: #555; }
+  #composer #upload-btn:disabled { opacity: 0.4; cursor: not-allowed; }
+
+  /* ---- Modal ---- */
+  #modal-overlay {
+    display: none;
+    position: fixed; inset: 0;
+    background: rgba(0,0,0,0.5);
+    align-items: center; justify-content: center;
+  }
+  #modal-overlay.visible { display: flex; }
+  #modal-box {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 20px;
+    width: 320px;
+  }
+  #modal-box h3 { margin: 0 0 12px; font-size: 15px; }
+  #modal-box input {
+    width: 100%;
+    background: #2f2f30;
+    color: var(--text);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 8px 10px;
+    font-size: 14px;
+    margin-bottom: 14px;
+  }
+  #modal-actions { display: flex; justify-content: flex-end; gap: 8px; }
+  #modal-actions button {
+    border: none;
+    border-radius: 6px;
+    padding: 7px 14px;
+    font-size: 13px;
+    cursor: pointer;
+  }
+  #modal-cancel { background: transparent; color: var(--muted); }
+  #modal-create { background: var(--accent); color: white; }
+</style>
+</head>
+<body>
+
+  <div id="sidebar">
+    <h2>Projects</h2>
+    <button id="new-project-btn">+ New Project</button>
+    <div id="project-list"></div>
+    <div id="conversation-section">
+      <h2>Conversations</h2>
+      <div id="conversation-controls">
+        <select id="conversation-select" disabled><option value="">New conversation</option></select>
+        <button id="delete-conversation-btn" title="Delete this conversation" disabled>🗑</button>
+      </div>
+    </div>
+    <div id="image-gallery-section">
+      <h2>Project Images</h2>
+      <div id="image-gallery"><div id="image-gallery-empty">Select a project to see its images</div></div>
+    </div>
+  </div>
+
+  <div id="main">
+    <div id="topbar">
+      <div id="status-dot" title="Model status"></div>
+      <div id="status-label">Not Ready</div>
+      <div id="project-title">Select a project</div>
+      <div id="mode-toggle">
+        <label><input type="checkbox" id="chat-mode-checkbox" checked><span>Chat Model</span></label>
+        <label><input type="checkbox" id="image-mode-checkbox"><span>Image Model</span></label>
+      </div>
+      <select id="model-select"><option>Loading models…</option></select>
+      <select id="checkpoint-select" disabled><option>Loading checkpoints…</option></select>
+      <button id="restart-btn" title="Restart the current model">Restart</button>
+      <button id="stop-btn" title="Stop everything — chat model, image generation, and the backend itself">Stop</button>
+      <button id="extended-context-btn" title="Doubles context length on next model load/restart. Uses more VRAM - may fail to load on some models.">2x Context: Off</button>
+      <button id="new-chat-btn">New Chat</button>
+    </div>
+
+    <div id="chat-scroll">
+      <div id="empty-state">Select or create a project to start chatting.</div>
+    </div>
+    <div id="typing-indicator">Generating…</div>
+
+    <div id="composer">
+      <input type="file" id="upload-input" accept=".png,.jpg,.jpeg,.webp,.gif,.pdf,.txt,.md" style="display:none">
+      <button id="upload-btn" title="Upload an image or document" disabled>📎</button>
+      <textarea id="input-box" rows="1" placeholder="Message…" disabled></textarea>
+      <button id="send-btn" disabled>Send</button>
+    </div>
+  </div>
+
+  <div id="modal-overlay">
+    <div id="modal-box">
+      <h3>New Project</h3>
+      <input id="modal-input" type="text" placeholder="Project name">
+      <div id="modal-actions">
+        <button id="modal-cancel">Cancel</button>
+        <button id="modal-create">Create</button>
+      </div>
+    </div>
+  </div>
+
+  <div id="lightbox-overlay">
+    <button id="lightbox-close" title="Close (Esc)">&times;</button>
+    <img id="lightbox-img" src="" alt="">
+    <div id="lightbox-caption"></div>
+  </div>
+
+<script>
+// Relative on purpose — the backend now serves this page itself (see
+// app.mount in backend/main.py), so API calls are same-origin. This is
+// also what lets the launcher open one URL instead of two separate
+// servers on two separate ports.
+const API_BASE = "";
+
+let currentProjectId = null;
+let currentConversationId = null;
+let selectedModel = null;
+let selectedCheckpoint = null;
+let activeMode = "chat"; // "chat" | "image" — only one is ever active at a time
+
+const el = (id) => document.getElementById(id);
+
+// ---------- API helpers ----------
+
+async function apiGet(path) {
+  const res = await fetch(`${API_BASE}${path}`);
+  if (!res.ok) throw new Error(`GET ${path} failed: ${res.status}`);
+  return res.json();
+}
+
+async function apiPost(path, body) {
+  const res = await fetch(`${API_BASE}${path}`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  if (!res.ok) {
+    const detail = await res.text();
+    throw new Error(`POST ${path} failed: ${res.status} — ${detail}`);
+  }
+  return res.json();
+}
+
+async function apiDelete(path) {
+  const res = await fetch(`${API_BASE}${path}`, { method: "DELETE" });
+  if (!res.ok) {
+    const detail = await res.text();
+    throw new Error(`DELETE ${path} failed: ${res.status} — ${detail}`);
+  }
+  return res.json();
+}
+
+// ---------- Health check ----------
+
+function setStatus(state, elapsedSeconds) {
+  // state is one of "ok", "busy", "bad", or "" (neutral/unknown).
+  // Single source of truth for both the dot and its text label, so
+  // they can never show conflicting information - every place in this
+  // file that changes model-readiness status goes through this.
+  //
+  // elapsedSeconds is optional - only meaningful while a model is
+  // actively loading. There's no honest percentage to show (llama.cpp's
+  // own load process doesn't expose one), so this shows real elapsed
+  // time rather than faking a progress bar. Omitted entirely once
+  // loading finishes.
+  const labels = { ok: "Ready", busy: "Busy", bad: "Not Ready", "": "Checking…" };
+  el("status-dot").className = state;
+  const label = el("status-label");
+  label.className = state;
+  let text = labels[state] ?? "Not Ready";
+  if (typeof elapsedSeconds === "number") {
+    text += ` (${elapsedSeconds.toFixed(1)}s)`;
+  }
+  label.textContent = text;
+}
+
+async function checkHealth() {
+  // While Image Model is active, the chat server is intentionally
+  // stopped — checking /api/health would report "Not Ready" for a state
+  // that's correct on purpose. Check the server that's actually meant to
+  // be running for the current mode instead.
+  if (activeMode === "image") {
+    try {
+      const data = await apiGet("/api/image/health");
+      setStatus(data.comfyui === "ok" ? "ok" : "bad");
+    } catch {
+      setStatus("bad");
+    }
+    return;
+  }
+
+  try {
+    const data = await apiGet("/api/health");
+    if (data.backend === "ok" && data.llama_cpp_server === "ok") {
+      setStatus("ok");
+    } else if (data.llama_cpp_server === "busy") {
+      setStatus("busy");
+    } else {
+      setStatus("bad", data.loading_elapsed_seconds ?? undefined);
+    }
+    syncExtendedContextButton(data.extended_context);
+  } catch {
+    setStatus("bad");
+  }
+}
+
+function syncExtendedContextButton(enabled) {
+  const btn = el("extended-context-btn");
+  btn.textContent = `2x Context: ${enabled ? "On" : "Off"}`;
+  btn.classList.toggle("on", !!enabled);
+}
+
+async function toggleExtendedContext() {
+  const btn = el("extended-context-btn");
+  const currentlyOn = btn.classList.contains("on");
+  btn.disabled = true;
+  try {
+    const data = await apiPost("/api/models/extended-context", { enabled: !currentlyOn });
+    syncExtendedContextButton(data.extended_context);
+    if (llama_manager_is_alive_hint()) {
+      await restartModel();
+    }
+  } catch (e) {
+    alert(`Could not change extended context setting: ${e.message}`);
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+// Small helper: only offer an immediate restart if a model is actually
+// loaded right now (status dot isn't red) — no point prompting to
+// restart something that isn't running.
+function llama_manager_is_alive_hint() {
+  return el("status-dot").className !== "bad";
+}
+
+// ---------- Models ----------
+
+async function loadModels() {
+  try {
+    const data = await apiGet("/api/models");
+    const select = el("model-select");
+    select.innerHTML = "";
+    if (data.models.length === 0) {
+      select.innerHTML = "<option>No models found in C:\\models</option>";
+      return;
+    }
+    data.models.forEach((m) => {
+      const opt = document.createElement("option");
+      opt.value = m.path;
+      opt.textContent = `${m.filename} (${m.size_gb} GB)${m.active ? " — active" : ""}`;
+      opt.selected = m.active;
+      select.appendChild(opt);
+      if (m.active) selectedModel = m.path;
+    });
+  } catch (e) {
+    el("model-select").innerHTML = "<option>Backend unreachable</option>";
+  }
+}
+
+async function swapModel(modelPath) {
+  const select = el("model-select");
+  const sendBtn = el("send-btn");
+  const previousDisabled = sendBtn.disabled;
+
+  select.disabled = true;
+  sendBtn.disabled = true;
+  setStatus(""); // neutral while swapping
+  const originalLabel = select.options[select.selectedIndex]?.textContent;
+  if (select.options[select.selectedIndex]) {
+    select.options[select.selectedIndex].textContent = "Loading model…";
+  }
+
+  try {
+    await apiPost("/api/models/swap", { model_path: modelPath });
+    selectedModel = modelPath;
+    await loadModels();
+    await checkHealth();
+  } catch (e) {
+    alert(`Model swap failed: ${e.message}`);
+    await loadModels(); // restore dropdown to reflect whatever actually ended up loaded
+  } finally {
+    select.disabled = false;
+    sendBtn.disabled = previousDisabled;
+  }
+}
+
+async function restartModel() {
+  const select = el("model-select");
+  const restartBtn = el("restart-btn");
+  const stopBtn = el("stop-btn");
+  const sendBtn = el("send-btn");
+  const previousDisabled = sendBtn.disabled;
+
+  select.disabled = true;
+  restartBtn.disabled = true;
+  stopBtn.disabled = true;
+  sendBtn.disabled = true;
+  setStatus("");
+
+  try {
+    await apiPost("/api/models/restart", {});
+    await loadModels();
+    await checkHealth();
+  } catch (e) {
+    alert(`Restart failed: ${e.message}`);
+    await loadModels();
+  } finally {
+    select.disabled = false;
+    restartBtn.disabled = false;
+    stopBtn.disabled = false;
+    sendBtn.disabled = previousDisabled;
+  }
+}
+
+async function stopEverything() {
+  if (!confirm(
+    "Stop LLMlifeline completely? This shuts down the chat model, image " +
+    "generation, and the backend itself. You'll need to run the launcher " +
+    "again to use it after this."
+  )) {
+    return;
+  }
+
+  el("stop-btn").disabled = true;
+
+  try {
+    await apiPost("/api/shutdown", {});
+  } catch (e) {
+    // The backend calls os._exit() shortly after responding, so the
+    // connection dying mid-flight here is the EXPECTED outcome, not a
+    // real failure — there's no server left to report one to.
+  }
+
+  // window.close() only works on a tab/window opened via window.open()
+  // from script — a tab the launcher opened with the OS's own "open a
+  // URL" call, or one the person typed in by hand, can't be closed this
+  // way in any modern browser. It's attempted as a harmless bonus; this
+  // in-page message is the actual, reliable outcome.
+  document.body.innerHTML =
+    '<div style="display:flex;align-items:center;justify-content:center;height:100vh;' +
+    'text-align:center;padding:20px;">' +
+    '<div><h2 style="margin-bottom:8px;">LLMlifeline has stopped.</h2>' +
+    '<p style="color:#9a9a9a;">All processes have been shut down. You can close this tab now.</p>' +
+    '</div></div>';
+  window.close();
+}
+
+// ---------- Image checkpoints ----------
+// Mirrors loadModels()/swapModel() above, but selecting a checkpoint is
+// pure selection state on the backend (no process restart) — ComfyUI
+// loads whichever checkpoint a workflow specifies per-request, so there's
+// no "loading model…" wait here the way there is for a chat-model swap.
+
+async function loadCheckpoints() {
+  try {
+    const data = await apiGet("/api/image/checkpoints");
+    const select = el("checkpoint-select");
+    select.innerHTML = "";
+    if (data.checkpoints.length === 0) {
+      select.innerHTML = "<option>No checkpoints found</option>";
+      return;
+    }
+    data.checkpoints.forEach((c) => {
+      const opt = document.createElement("option");
+      opt.value = c.filename;
+      opt.textContent = `${c.filename} (${c.size_gb} GB)${c.active ? " — active" : ""}`;
+      opt.selected = c.active;
+      select.appendChild(opt);
+      if (c.active) selectedCheckpoint = c.filename;
+    });
+    // Auto-select the first checkpoint if nothing's been explicitly
+    // chosen yet, so Image Model is immediately usable — generating
+    // shouldn't require an extra manual dropdown click first.
+    if (!selectedCheckpoint && data.checkpoints.length > 0) {
+      await setCheckpoint(data.checkpoints[0].filename);
+    }
+  } catch (e) {
+    el("checkpoint-select").innerHTML = "<option>Backend unreachable</option>";
+  }
+}
+
+async function setCheckpoint(filename) {
+  const select = el("checkpoint-select");
+  select.disabled = true;
+  try {
+    await apiPost("/api/image/checkpoint", { checkpoint: filename });
+    selectedCheckpoint = filename;
+    await loadCheckpoints();
+  } catch (e) {
+    alert(`Checkpoint selection failed: ${e.message}`);
+    await loadCheckpoints(); // restore dropdown to reflect whatever's actually selected
+  } finally {
+    select.disabled = activeMode !== "image";
+  }
+}
+
+// ---------- Chat/Image mode switch ----------
+// The two checkboxes behave like a radio pair (exactly one active at a
+// time), but stay real independent checkboxes per the product's design —
+// unchecking one directly is rejected (forced back on) and only checking
+// the *other* one actually triggers a switch.
+
+function setModeControlsDisabled(disabled) {
+  el("chat-mode-checkbox").disabled = disabled;
+  el("image-mode-checkbox").disabled = disabled;
+}
+
+function applyModeToControls() {
+  // Chat-side controls (restart/stop/2x-context/model dropdown) only
+  // make sense while a chat model is meant to be running; same for the
+  // checkpoint dropdown on the image side. The composer, though, is
+  // valid in BOTH modes — it just means something different (a chat
+  // message vs. an image prompt) — sendMessage() is what branches on
+  // activeMode, not this disabling logic.
+  const chatActive = activeMode === "chat";
+  el("model-select").disabled = !chatActive;
+  el("restart-btn").disabled = !chatActive;
+  // stop-btn is NOT gated on mode — it shuts the whole app down (backend
+  // included), which should always be reachable regardless of whether
+  // Chat or Image Model happens to be active right now.
+  el("extended-context-btn").disabled = !chatActive;
+  el("checkpoint-select").disabled = chatActive;
+  el("input-box").disabled = !currentProjectId;
+  el("send-btn").disabled = !currentProjectId;
+  el("input-box").placeholder = chatActive ? "Message…" : "Describe an image…";
+  // Uploading a reference image/document doesn't depend on which server
+  // is running — captioning and document extraction are local, separate
+  // from both llama_cpp.server and ComfyUI — so this is gated purely on
+  // having a project selected, not on activeMode.
+  el("upload-btn").disabled = !currentProjectId;
+}
+
+async function switchToImageMode() {
+  setModeControlsDisabled(true);
+  setStatus(""); // neutral while switching
+  try {
+    await apiPost("/api/models/stop", {});
+    await apiPost("/api/image/start", {});
+    activeMode = "image";
+    el("chat-mode-checkbox").checked = false;
+    el("image-mode-checkbox").checked = true;
+    await loadModels();
+    await loadCheckpoints();
+    await checkHealth();
+  } catch (e) {
+    alert(`Could not switch to Image Model: ${e.message}`);
+    el("chat-mode-checkbox").checked = true;
+    el("image-mode-checkbox").checked = false;
+  } finally {
+    applyModeToControls();
+    setModeControlsDisabled(false);
+  }
+}
+
+async function switchToChatMode() {
+  // If no chat model was active before switching to Image Model (e.g.
+  // Image Model was turned on before ever loading one), fall back to
+  // the first available model instead of leaving no way back to Chat
+  // Model at all.
+  let modelToLoad = selectedModel;
+  if (!modelToLoad) {
+    try {
+      const data = await apiGet("/api/models");
+      if (data.models.length > 0) modelToLoad = data.models[0].path;
+    } catch {
+      // handled by the check below — apiGet failing leaves modelToLoad unset
+    }
+  }
+
+  if (!modelToLoad) {
+    alert("No chat models found — add a .gguf file to the models folder first.");
+    el("chat-mode-checkbox").checked = false;
+    el("image-mode-checkbox").checked = true;
+    return;
+  }
+
+  setModeControlsDisabled(true);
+  setStatus("");
+  try {
+    await apiPost("/api/image/stop", {});
+    await apiPost("/api/models/swap", { model_path: modelToLoad });
+    activeMode = "chat";
+    el("chat-mode-checkbox").checked = true;
+    el("image-mode-checkbox").checked = false;
+    await loadModels();
+    await checkHealth();
+  } catch (e) {
+    alert(`Could not switch back to Chat Model: ${e.message}`);
+    el("chat-mode-checkbox").checked = false;
+    el("image-mode-checkbox").checked = true;
+  } finally {
+    applyModeToControls();
+    setModeControlsDisabled(false);
+  }
+}
+
+// ---------- Projects ----------
+
+async function loadProjects() {
+  const data = await apiGet("/api/projects");
+  const list = el("project-list");
+  list.innerHTML = "";
+  data.projects.forEach((p) => {
+    const item = document.createElement("div");
+    item.className = "project-item" + (p.id === currentProjectId ? " active" : "");
+    item.innerHTML = `${escapeHtml(p.name)}<span class="conv-count">${p.conversation_count} conversation${p.conversation_count === 1 ? "" : "s"}</span>`;
+    item.addEventListener("click", () => selectProject(p.id, p.name));
+    list.appendChild(item);
+  });
+}
+
+async function createProject(name) {
+  const project = await apiPost("/api/projects", { name });
+  await loadProjects();
+  await selectProject(project.id, project.name);
+}
+
+async function selectProject(id, name) {
+  currentProjectId = id;
+  currentConversationId = null;
+  el("project-title").textContent = name;
+  applyModeToControls(); // enables input/send only if Chat Model is the active mode
+  clearChat();
+  await loadProjects(); // refresh active highlight
+  await loadProjectImages(id);
+  await loadConversations(id);
+}
+
+// ---------- Conversation picker (load/delete past conversations) ----------
+
+/**
+ * Populates the sidebar conversation dropdown for a project. Pass
+ * selectId to land on a specific conversation after refreshing (e.g.
+ * the one that was just created or is currently open) — otherwise it
+ * resets to the "New conversation" placeholder.
+ */
+async function loadConversations(projectId, selectId) {
+  const select = el("conversation-select");
+  const deleteBtn = el("delete-conversation-btn");
+  select.innerHTML = "";
+  const newOpt = document.createElement("option");
+  newOpt.value = "";
+  newOpt.textContent = "New conversation";
+  select.appendChild(newOpt);
+
+  try {
+    const data = await apiGet(`/api/projects/${projectId}/conversations`);
+    data.conversations.forEach((c) => {
+      const opt = document.createElement("option");
+      opt.value = c.id;
+      // title is filled in a few seconds after a conversation starts
+      // (generated by the chat model in the background — see
+      // _title_background_task) — until then, fall back to the plain
+      // truncated first message, same as before this feature existed.
+      opt.textContent = c.title || c.preview || "(empty conversation)";
+      select.appendChild(opt);
+    });
+    select.disabled = false;
+  } catch (e) {
+    select.disabled = true;
+  }
+
+  select.value = selectId || "";
+  deleteBtn.disabled = !select.value;
+}
+
+/** Fetches one conversation and replaces the chat panel with its full history, timestamps included. */
+async function loadConversationIntoChat(projectId, conversationId) {
+  if (!conversationId) {
+    currentConversationId = null;
+    clearChat();
+    el("delete-conversation-btn").disabled = true;
+    return;
+  }
+  try {
+    const conversation = await apiGet(`/api/projects/${projectId}/conversations/${conversationId}`);
+    currentConversationId = conversationId;
+    el("chat-scroll").innerHTML = "";
+    const messages = conversation.messages || [];
+    if (messages.length === 0) {
+      clearChat();
+    } else {
+      messages.forEach((m) => {
+        addMessageBubble(m.role, m.content, m.reasoning, m.image_url, m.timestamp);
+      });
+    }
+    el("delete-conversation-btn").disabled = false;
+  } catch (e) {
+    alert(`Could not load conversation: ${e.message}`);
+  }
+}
+
+async function deleteCurrentConversation() {
+  const id = el("conversation-select").value;
+  if (!id || !currentProjectId) return;
+  if (!confirm("Delete this conversation? This can't be undone.")) return;
+
+  el("delete-conversation-btn").disabled = true;
+  try {
+    await apiDelete(`/api/projects/${currentProjectId}/conversations/${id}`);
+    if (currentConversationId === id) {
+      currentConversationId = null;
+      clearChat();
+    }
+    await loadConversations(currentProjectId, currentConversationId);
+    await loadProjects(); // conversation count changed
+  } catch (e) {
+    alert(`Delete failed: ${e.message}`);
+    el("delete-conversation-btn").disabled = !id;
+  }
+}
+
+// ---------- Project image gallery + lightbox ----------
+
+async function loadProjectImages(projectId) {
+  const gallery = el("image-gallery");
+  gallery.innerHTML = "";
+  try {
+    const data = await apiGet(`/api/projects/${projectId}/images`);
+    if (data.images.length === 0) {
+      gallery.innerHTML = '<div id="image-gallery-empty">No images in this project yet</div>';
+      return;
+    }
+    data.images.forEach((img) => {
+      const thumb = document.createElement("img");
+      thumb.className = "gallery-thumb";
+      thumb.src = `${API_BASE}${img.url}`;
+      thumb.alt = img.caption || img.filename;
+      thumb.title = img.caption || img.filename;
+      thumb.addEventListener("click", () => openLightbox(img.url, img.caption));
+      gallery.appendChild(thumb);
+    });
+  } catch (e) {
+    gallery.innerHTML = '<div id="image-gallery-empty">Could not load images</div>';
+  }
+}
+
+function openLightbox(url, caption) {
+  const img = el("lightbox-img");
+  img.classList.remove("zoomed"); // always open at fit-to-screen, not mid-zoom from a prior view
+  img.src = `${API_BASE}${url}`;
+  el("lightbox-caption").textContent = caption || "";
+  el("lightbox-overlay").classList.add("visible");
+}
+
+function closeLightbox() {
+  el("lightbox-overlay").classList.remove("visible");
+  el("lightbox-img").src = "";
+}
+
+// ---------- Chat rendering ----------
+
+function clearChat() {
+  el("chat-scroll").innerHTML = '<div id="empty-state">New conversation — say something.</div>';
+}
+
+function escapeHtml(s) {
+  const d = document.createElement("div");
+  d.textContent = s;
+  return d.innerHTML;
+}
+
+/**
+ * Splits assistant content into a leading <think>...</think> block (if
+ * present) plus the real answer, and renders the thinking part as a
+ * collapsed <details> so it doesn't dominate the reply. Collapsed by
+ * default per product decision — true suppression at the model level is
+ * still an open item (see backend main.py comments).
+ */
+function renderAssistantContent(container, content, reasoning) {
+  // Prefer the backend's pre-parsed reasoning field. Fall back to
+  // client-side <think> parsing only for conversations saved before this
+  // change, where raw tags may still be sitting in stored content.
+  if (!reasoning) {
+    const thinkMatch = content.match(/^<think>([\s\S]*?)<\/think>\s*([\s\S]*)$/);
+    if (thinkMatch) {
+      reasoning = thinkMatch[1].trim();
+      content = thinkMatch[2].trim();
+    }
+  }
+
+  if (reasoning) {
+    const details = document.createElement("details");
+    details.className = "think-block";
+    const summary = document.createElement("summary");
+    summary.textContent = "Reasoning (click to expand)";
+    const thinkContent = document.createElement("div");
+    thinkContent.className = "think-content";
+    thinkContent.textContent = reasoning;
+    details.appendChild(summary);
+    details.appendChild(thinkContent);
+    container.appendChild(details);
+
+    const answerP = document.createElement("div");
+    answerP.textContent = content;
+    container.appendChild(answerP);
+  } else {
+    container.textContent = content;
+  }
+}
+
+function addMessageBubble(role, content, reasoning, imageUrl, timestamp) {
+  const emptyState = el("empty-state");
+  if (emptyState) emptyState.remove();
+
+  const row = document.createElement("div");
+  row.className = `msg-row ${role}`;
+  const bubble = document.createElement("div");
+  bubble.className = "bubble";
+
+  if (imageUrl) {
+    const img = document.createElement("img");
+    img.src = `${API_BASE}${imageUrl}`;
+    img.alt = content;
+    img.className = "generated-image";
+    bubble.appendChild(img);
+    const caption = document.createElement("div");
+    caption.className = "generated-image-caption";
+    caption.textContent = content;
+    bubble.appendChild(caption);
+  } else if (role === "assistant") {
+    renderAssistantContent(bubble, content, reasoning);
+  } else {
+    bubble.textContent = content;
+  }
+
+  if (timestamp) {
+    const ts = document.createElement("div");
+    ts.className = "msg-timestamp";
+    ts.textContent = formatTimestamp(timestamp);
+    bubble.appendChild(ts);
+  }
+
+  row.appendChild(bubble);
+  el("chat-scroll").appendChild(row);
+  el("chat-scroll").scrollTop = el("chat-scroll").scrollHeight;
+}
+
+/**
+ * Renders a stored ISO timestamp the way a normal chat app would: just
+ * the time for anything sent today, date + time once it's from an
+ * earlier day — full precision (seconds, timezone offset) isn't useful
+ * for "when did I send this," so it's deliberately not shown.
+ */
+function formatTimestamp(isoString) {
+  try {
+    const d = new Date(isoString);
+    if (isNaN(d.getTime())) return "";
+    const sameDay = d.toDateString() === new Date().toDateString();
+    return sameDay
+      ? d.toLocaleTimeString([], { hour: "numeric", minute: "2-digit" })
+      : d.toLocaleString([], { month: "short", day: "numeric", hour: "numeric", minute: "2-digit" });
+  } catch {
+    return "";
+  }
+}
+
+// ---------- Sending messages ----------
+
+async function sendMessage() {
+  const input = el("input-box");
+  const text = input.value.trim();
+  if (!text || !currentProjectId) return;
+
+  addMessageBubble("user", text, null, null, new Date().toISOString());
+  input.value = "";
+  input.style.height = "auto";
+  el("send-btn").disabled = true;
+  const typing = el("typing-indicator");
+  typing.textContent = activeMode === "image" ? "Generating image…" : "Generating…";
+  typing.classList.add("visible");
+
+  try {
+    if (activeMode === "image") {
+      const data = await apiPost("/api/image/generate", {
+        project_id: currentProjectId,
+        conversation_id: currentConversationId,
+        prompt: text,
+      });
+      currentConversationId = data.conversation_id;
+      const caption = data.caption
+        ? `Generated an image for: "${text}"\n\nDescription: ${data.caption}`
+        : `Generated an image for: "${text}"`;
+      addMessageBubble("assistant", caption, null, data.image_url, data.timestamp);
+    } else {
+      const data = await apiPost("/api/chat", {
+        project_id: currentProjectId,
+        conversation_id: currentConversationId,
+        messages: [{ role: "user", content: text }],
+      });
+      currentConversationId = data.conversation_id;
+      addMessageBubble("assistant", data.reply, data.reasoning, null, data.timestamp);
+    }
+    await loadProjects(); // conversation count changed
+    await loadConversations(currentProjectId, currentConversationId); // new/updated conversation in the picker
+    if (activeMode === "image") await loadProjectImages(currentProjectId); // new generated image
+  } catch (e) {
+    addMessageBubble("assistant", `[Error] ${e.message}`);
+  } finally {
+    el("send-btn").disabled = false;
+    typing.classList.remove("visible");
+    typing.textContent = "Generating…"; // reset for next send
+  }
+}
+
+// ---------- File uploads ----------
+// Separate from sendMessage's text-only flow: an upload has its own
+// endpoint (multipart, not JSON) and works the same regardless of
+// activeMode — captioning/document extraction are local and don't
+// depend on which of llama_cpp.server or ComfyUI happens to be running.
+
+async function uploadFile(file) {
+  if (!currentProjectId) return;
+
+  const uploadBtn = el("upload-btn");
+  uploadBtn.disabled = true;
+  const typing = el("typing-indicator");
+  typing.textContent = "Uploading…";
+  typing.classList.add("visible");
+
+  const formData = new FormData();
+  formData.append("file", file);
+  if (currentConversationId) formData.append("conversation_id", currentConversationId);
+
+  try {
+    const res = await fetch(`${API_BASE}/api/projects/${currentProjectId}/upload`, {
+      method: "POST",
+      body: formData,
+    });
+    if (!res.ok) {
+      const detail = await res.text();
+      throw new Error(`Upload failed: ${res.status} — ${detail}`);
+    }
+    const data = await res.json();
+    currentConversationId = data.conversation_id;
+
+    if (data.type === "image") {
+      const caption = data.caption
+        ? `Uploaded image: ${file.name}\n\nDescription: ${data.caption}`
+        : `Uploaded image: ${file.name}`;
+      addMessageBubble("user", caption, null, data.image_url, data.timestamp);
+    } else {
+      addMessageBubble("user", `Uploaded document: ${data.filename} (${data.chunks_indexed} passages indexed)`, null, null, data.timestamp);
+    }
+    await loadProjects(); // conversation count changed
+    await loadConversations(currentProjectId, currentConversationId); // new/updated conversation in the picker
+    if (data.type === "image") await loadProjectImages(currentProjectId); // new uploaded image
+  } catch (e) {
+    addMessageBubble("assistant", `[Error] ${e.message}`);
+  } finally {
+    uploadBtn.disabled = !currentProjectId;
+    typing.classList.remove("visible");
+    typing.textContent = "Generating…"; // reset for next send
+  }
+}
+
+// ---------- Wiring ----------
+
+el("lightbox-img").addEventListener("click", (e) => e.target.classList.toggle("zoomed"));
+el("lightbox-close").addEventListener("click", closeLightbox);
+el("lightbox-overlay").addEventListener("click", (e) => {
+  if (e.target.id === "lightbox-overlay") closeLightbox(); // click on the backdrop, not the image
+});
+document.addEventListener("keydown", (e) => {
+  if (e.key === "Escape" && el("lightbox-overlay").classList.contains("visible")) closeLightbox();
+});
+
+el("send-btn").addEventListener("click", sendMessage);
+el("upload-btn").addEventListener("click", () => el("upload-input").click());
+el("upload-input").addEventListener("change", (e) => {
+  const file = e.target.files[0];
+  if (file) uploadFile(file);
+  e.target.value = ""; // clear so re-uploading the same filename still fires 'change'
+});
+el("input-box").addEventListener("keydown", (e) => {
+  if (e.key === "Enter" && !e.shiftKey) {
+    e.preventDefault();
+    sendMessage();
+  }
+});
+el("input-box").addEventListener("input", (e) => {
+  e.target.style.height = "auto";
+  e.target.style.height = e.target.scrollHeight + "px";
+});
+
+el("new-chat-btn").addEventListener("click", () => {
+  currentConversationId = null;
+  clearChat();
+  el("conversation-select").value = "";
+  el("delete-conversation-btn").disabled = true;
+});
+el("conversation-select").addEventListener("change", (e) => {
+  if (currentProjectId) loadConversationIntoChat(currentProjectId, e.target.value);
+});
+el("delete-conversation-btn").addEventListener("click", deleteCurrentConversation);
+el("restart-btn").addEventListener("click", restartModel);
+el("extended-context-btn").addEventListener("click", toggleExtendedContext);
+el("stop-btn").addEventListener("click", stopEverything);
+
+el("chat-mode-checkbox").addEventListener("change", (e) => {
+  if (!e.target.checked) {
+    e.target.checked = true; // reject direct uncheck — only the other box drives a switch
+    return;
+  }
+  if (activeMode !== "chat") switchToChatMode();
+});
+el("image-mode-checkbox").addEventListener("change", (e) => {
+  if (!e.target.checked) {
+    e.target.checked = true;
+    return;
+  }
+  if (activeMode !== "image") switchToImageMode();
+});
+el("checkpoint-select").addEventListener("change", (e) => {
+  if (e.target.value && e.target.value !== selectedCheckpoint) {
+    setCheckpoint(e.target.value);
+  }
+});
+
+el("new-project-btn").addEventListener("click", () => {
+  el("modal-input").value = "";
+  el("modal-overlay").classList.add("visible");
+  el("modal-input").focus();
+});
+el("modal-cancel").addEventListener("click", () => {
+  el("modal-overlay").classList.remove("visible");
+});
+el("modal-create").addEventListener("click", async () => {
+  const name = el("modal-input").value.trim();
+  if (!name) return;
+  el("modal-overlay").classList.remove("visible");
+  await createProject(name);
+});
+el("modal-input").addEventListener("keydown", (e) => {
+  if (e.key === "Enter") el("modal-create").click();
+});
+
+// ---------- Init ----------
+
+(async function init() {
+  await checkHealth();
+  await loadModels();
+  await loadCheckpoints();
+  await loadProjects();
+  applyModeToControls(); // activeMode starts "chat" — checkpoint-select disabled, chat controls enabled
+  el("model-select").addEventListener("change", (e) => {
+    if (e.target.value && e.target.value !== selectedModel) {
+      swapModel(e.target.value);
+    }
+  });
+  setInterval(checkHealth, 15000);
+  setInterval(loadModels, 15000);
+  setInterval(loadCheckpoints, 15000);
+  // Picks up a conversation title once it finishes generating in the
+  // background (see _title_background_task) without needing to
+  // reselect the project — same "just refresh periodically" approach
+  // as the other setIntervals above.
+  setInterval(() => {
+    if (currentProjectId) loadConversations(currentProjectId, currentConversationId);
+  }, 15000);
+})();
+</script>
+
+</body>
+</html>

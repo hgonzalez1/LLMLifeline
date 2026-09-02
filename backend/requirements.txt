@@ -1,0 +1,16 @@
+fastapi
+uvicorn
+httpx
+python-multipart
+llama-cpp-python
+pypdf
+numpy
+comfy_kitchen==0.2.31
+Pillow
+transformers
+tokenizers
+safetensors
+aiohttp
+pyyaml
+scipy
+tqdm

@@ -1,0 +1,55 @@
+# Virtual environment — machine-specific (bakes in an absolute path to
+# its own Python install, see launcher.py's ensure_venv docstring) and
+# huge. Recreated automatically by start.bat/LLMlifeline.exe on first run.
+llm-env/
+
+# ComfyUI — a real upstream clone (github.com/comfyanonymous/ComfyUI),
+# not this project's own code. Cloned automatically on first run,
+# pinned to the commit this project was built against (see
+# launcher.py's COMFYUI_PINNED_COMMIT).
+ComfyUI/
+
+# Model weight files — tens of GB each, never belong in git regardless
+# of host limits. The default set is downloaded automatically on first
+# run by download_models.py; anything placed here manually is exactly
+# as excluded, on purpose, since a person's own model choices are
+# theirs to keep out of a shared repo too.
+models/*.gguf
+models/*.safetensors
+
+# This machine's own marker that download_models.py already ran here —
+# NOT something to ship. If this got committed, every fresh clone would
+# start with the marker already present and download_models.py would
+# skip the default download entirely, breaking the whole "just works on
+# a new machine" point of that script.
+models/.default_models_downloaded
+
+# Your own data — conversations, personas, generated images, and
+# uploaded reference material are personal by nature (and beliefs/ in
+# particular can easily contain copyrighted material, e.g. a modern
+# Bible translation) and shouldn't ride along into a shared/public repo
+# by accident. Ignoring every file type here, not just the ones seen so
+# far, since anything dropped into beliefs/ is personal by definition.
+projects/
+generated_images/
+persona.txt
+beliefs/*
+!beliefs/.gitkeep
+
+# Runtime logs and caches
+*.log
+**/.cache/
+__pycache__/
+*.pyc
+
+# PyInstaller build output — build_exe.bat regenerates both from
+# launcher.py; neither is meant to be hand-edited or diffed.
+build/
+LLMlifeline.exe
+
+# Scratch/leftover files from development that never belonged in the
+# shipped project — not code, not docs, just clutter that happened to
+# be sitting in this folder.
+/conversations/
+hf_meta.json
+/new 4.txt
