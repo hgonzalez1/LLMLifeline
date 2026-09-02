@@ -24,17 +24,19 @@ models/*.safetensors
 # a new machine" point of that script.
 models/.default_models_downloaded
 
-# Your own data — conversations, personas, generated images, and
-# uploaded reference material are personal by nature (and beliefs/ in
-# particular can easily contain copyrighted material, e.g. a modern
-# Bible translation) and shouldn't ride along into a shared/public repo
-# by accident. Ignoring every file type here, not just the ones seen so
-# far, since anything dropped into beliefs/ is personal by definition.
+# Conversations and generated images are still excluded — that's your
+# actual usage history, not product content, and there's no version of
+# it that makes sense to ship as a "default."
 projects/
 generated_images/
-persona.txt
-beliefs/*
-!beliefs/.gitkeep
+
+# persona.txt and beliefs/ ARE shipped as real defaults, by request —
+# everything in beliefs/ EXCEPT the NASB translation specifically,
+# which is copyrighted by the Lockman Foundation and not ours to
+# redistribute. The KJV, personal notes, and concordance are fine (KJV
+# is public domain; the rest is original writing).
+beliefs/_cache/
+beliefs/NASB New American Standard Bible (NASB).pdf
 
 # Runtime logs and caches
 *.log
