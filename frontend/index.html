@@ -379,6 +379,16 @@
   }
   #typing-indicator.visible { display: block; }
 
+  #context-trimmed-notice {
+    display: none;
+    color: #d9a843;
+    font-size: 12.5px;
+    padding: 6px 20px;
+    background: #2f2a1a;
+    border-top: 1px solid var(--border);
+  }
+  #context-trimmed-notice.visible { display: block; }
+
   /* ---- Composer ---- */
   #composer {
     display: flex;
@@ -500,6 +510,7 @@
       <div id="empty-state">Select or create a project to start chatting.</div>
     </div>
     <div id="typing-indicator">Generating…</div>
+    <div id="context-trimmed-notice">ℹ️ This conversation has grown long — the assistant's memory of it for this reply left out some of the oldest messages to fit the model's context limit. Nothing was deleted; it's still in the conversation history above.</div>
 
     <div id="composer">
       <input type="file" id="upload-input" accept=".png,.jpg,.jpeg,.webp,.gif,.pdf,.txt,.md" style="display:none">
@@ -988,6 +999,7 @@ async function loadConversations(projectId, selectId) {
 
 /** Fetches one conversation and replaces the chat panel with its full history, timestamps included. */
 async function loadConversationIntoChat(projectId, conversationId) {
+  el("context-trimmed-notice").classList.remove("visible"); // notice was about the previously-viewed conversation's last reply, not this one
   if (!conversationId) {
     currentConversationId = null;
     clearChat();
@@ -1188,6 +1200,7 @@ async function sendMessage() {
   input.value = "";
   input.style.height = "auto";
   el("send-btn").disabled = true;
+  el("context-trimmed-notice").classList.remove("visible"); // stale from a previous reply until this one's result is known
   const typing = el("typing-indicator");
   typing.textContent = activeMode === "image" ? "Generating image…" : "Generating…";
   typing.classList.add("visible");
@@ -1212,6 +1225,7 @@ async function sendMessage() {
       });
       currentConversationId = data.conversation_id;
       addMessageBubble("assistant", data.reply, data.reasoning, null, data.timestamp);
+      el("context-trimmed-notice").classList.toggle("visible", !!data.history_trimmed);
     }
     await loadProjects(); // conversation count changed
     await loadConversations(currentProjectId, currentConversationId); // new/updated conversation in the picker

@@ -155,6 +155,26 @@ def _detect_free_vram_mb() -> int | None:
     return None
 
 
+def _detect_total_vram_mb() -> int | None:
+    """
+    Same approach as _detect_free_vram_mb, but the card's total capacity
+    rather than what's free right now — needed to recognize when a
+    model's file size alone already exceeds the whole card, not just
+    the current headroom on it. Returns None under the same conditions
+    _detect_free_vram_mb does.
+    """
+    try:
+        result = subprocess.run(
+            ["nvidia-smi", "--query-gpu=memory.total", "--format=csv,noheader,nounits"],
+            capture_output=True, text=True, timeout=10,
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            return int(result.stdout.strip().splitlines()[0])
+    except (subprocess.SubprocessError, FileNotFoundError, ValueError, OSError):
+        pass
+    return None
+
+
 def _choose_context_length(model_path: str, doubled: bool = False) -> int:
     """
     Pick a context length based on free VRAM relative to the model's own
@@ -195,20 +215,39 @@ def _choose_context_length(model_path: str, doubled: bool = False) -> int:
         except OSError:
             return 2048
 
-        headroom_mb = free_vram_mb - model_size_mb
-
-        # Thresholds are deliberately conservative — this build's own history
-        # includes a real CUDA OOM risk being flagged repeatedly for models
-        # sitting close to this card's VRAM ceiling. Erring toward a smaller
-        # context that definitely loads is the right default.
-        if headroom_mb < 500:
-            base = 1024
-        elif headroom_mb < 2000:
-            base = 2048
-        elif headroom_mb < 4000:
+        total_vram_mb = _detect_total_vram_mb()
+        if total_vram_mb is not None and model_size_mb > total_vram_mb:
+            # The model's file size alone is bigger than the whole card —
+            # it cannot be primarily GPU-resident no matter how much is
+            # free right now, so it's already running with heavy CPU
+            # offload (system RAM, not VRAM, hosts most of the weights).
+            # Confirmed hitting this in practice with a 26.6GB model on an
+            # 11GB card: the free-vs-model headroom math below assumes a
+            # model that basically fits on the card and gets conservative
+            # as that fit gets tight — applied here, headroom is just
+            # deeply negative and it always bottoms out at the smallest,
+            # least usable tier (1024, or 2048 doubled), regardless of the
+            # extended-context toggle. A model this size is already slow
+            # from CPU offload; a bigger KV cache isn't what makes it
+            # unusable, so use a genuinely useful context instead of the
+            # smallest tier.
             base = 4096
         else:
-            base = 8192
+            headroom_mb = free_vram_mb - model_size_mb
+
+            # Thresholds are deliberately conservative — this build's own
+            # history includes a real CUDA OOM risk being flagged repeatedly
+            # for models sitting close to this card's VRAM ceiling. Erring
+            # toward a smaller context that definitely loads is the right
+            # default when the model genuinely might fit on the GPU.
+            if headroom_mb < 500:
+                base = 1024
+            elif headroom_mb < 2000:
+                base = 2048
+            elif headroom_mb < 4000:
+                base = 4096
+            else:
+                base = 8192
 
     return base * 2 if doubled else base
 
@@ -228,6 +267,7 @@ class LlamaServerManager:
         self.log_file = None
         self.extended_context = False  # toggle: doubles the auto-selected context length
         self.load_started_at: float | None = None  # time.time() when the current/last load began
+        self.context_length: int | None = None  # the real n_ctx the running server was launched with — set in start(), used by /api/chat to budget history against instead of guessing
 
     def start(self, model_path: str):
         """Launch llama_cpp.server as a subprocess pointed at model_path.
@@ -245,6 +285,7 @@ class LlamaServerManager:
         self.log_file = open(self.log_path, "w", encoding="utf-8")
 
         chosen_context = _choose_context_length(model_path, doubled=self.extended_context)
+        self.context_length = chosen_context
         self.load_started_at = time.time()
         self.process = subprocess.Popen(
             [
@@ -1890,6 +1931,137 @@ async def _title_background_task(project_id: str, conversation_id: str, first_me
 
 # ---- Chat proxy ----
 
+async def _real_token_count(text: str) -> int | None:
+    """
+    Ask the running llama_cpp.server to tokenize text with the actual
+    model's real tokenizer, via its /extras/tokenize/count endpoint
+    (confirmed present in the installed llama-cpp-python version). This
+    is a genuine token count for the exact model in use, not a guess.
+    Returns None on any failure — connection issue, older server build
+    without this endpoint, unexpected response shape — so callers fall
+    back to an estimate explicitly rather than trusting a wrong number.
+    """
+    if not text:
+        return 0
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            r = await client.post(
+                f"{LLAMA_SERVER_URL}/extras/tokenize/count", json={"input": text}
+            )
+            r.raise_for_status()
+            return r.json()["count"]
+    except (httpx.HTTPError, KeyError, ValueError, TypeError):
+        return None
+
+
+def _estimate_token_count(text: str) -> int:
+    """
+    Cheap fallback when the real tokenizer endpoint isn't reachable.
+    Deliberately conservative (divides by 3, not the more typical ~4
+    characters/token for English) so a wrong guess errs toward trimming
+    more than necessary rather than not enough.
+    """
+    return max(1, len(text) // 3)
+
+
+async def _token_count(text: str) -> int:
+    real = await _real_token_count(text)
+    return real if real is not None else _estimate_token_count(text)
+
+
+async def _fit_history_to_context(
+    history_for_model: list[dict], context_length: int
+) -> tuple[list[dict], bool]:
+    """
+    Trim history_for_model (a system message at index 0, if present,
+    then alternating user/assistant turns) so its total token count fits
+    inside the model's actual configured context window, leaving room
+    for the reply itself. Drops the OLDEST user/assistant pair at a time
+    — never the system message, never the most recent turn — until it
+    fits. Returns (possibly-trimmed history, whether anything was
+    actually dropped).
+
+    This exists because llama_cpp.server fixes n_ctx at model-load time
+    and hard-rejects any request that doesn't fit — there is no way to
+    raise it per-request, and this app sends the entire saved
+    conversation on every turn (see the comment above where
+    history_for_model is built). Without this, a conversation that grows
+    past the model's context window fails outright, every single turn,
+    with no way to recover except starting a new conversation by hand.
+    Trimming proactively here means a long conversation just gradually
+    forgets its oldest turns instead — the same tradeoff most chat apps
+    make once a conversation outgrows what a model can see at once.
+
+    Drops in pairs (not one message at a time) specifically because at
+    least one model in real use here (Gemma) hard-rejects a request
+    whose messages don't strictly alternate user/assistant — dropping a
+    single message from the middle of a pair would break that.
+    """
+    RESPONSE_RESERVE = 512  # leave room for the model's own reply
+    SAFETY_MARGIN = 64      # chat-template formatting adds a little overhead this doesn't capture by summing raw content alone
+    budget = max(context_length - RESPONSE_RESERVE - SAFETY_MARGIN, 256)
+
+    has_system = bool(history_for_model) and history_for_model[0]["role"] == "system"
+    system_msg = history_for_model[0] if has_system else None
+    turns = history_for_model[1:] if has_system else list(history_for_model)
+
+    def joined_text(msgs: list[dict]) -> str:
+        parts = ([system_msg["content"]] if system_msg else []) + [m["content"] for m in msgs]
+        return "\n\n".join(parts)
+
+    trimmed = False
+    for _ in range(50):  # hard safety cap — should never actually take this many passes
+        total = await _token_count(joined_text(turns))
+        if total <= budget or len(turns) <= 1:
+            break
+        trimmed = True
+        excess = total - budget
+        avg_per_msg = total / len(turns) if turns else 1
+        # Jump straight to roughly the right number of oldest messages to
+        # drop instead of removing one pair and re-tokenizing every time —
+        # keeps this fast even for a very long conversation. Always an
+        # even number so pairing is preserved, always leaves at least one
+        # turn behind.
+        jump = max(2, int(excess / avg_per_msg))
+        jump -= jump % 2
+        jump = min(jump, len(turns) - 1)
+        turns = turns[jump:]
+
+    result = ([system_msg] if system_msg else []) + turns
+    return result, trimmed
+
+
+def _friendly_llama_error(e: httpx.HTTPStatusError) -> str:
+    """
+    Turn whatever llama_cpp.server sent back into a plain-English message
+    instead of surfacing its raw JSON error body to a non-technical
+    person. Must never raise itself — it runs inside an exception
+    handler, and a second exception there would replace a handled error
+    with an unhandled one.
+    """
+    message = ""
+    try:
+        body = e.response.json()
+        message = body.get("error", {}).get("message", "") or ""
+    except (ValueError, AttributeError):
+        pass
+
+    if "context length" in message.lower() or "context_length_exceeded" in message.lower():
+        return (
+            "This conversation — plus its instructions and any related files or "
+            "past messages the assistant pulled in — is too long for the "
+            "current model to handle in one request, even after automatically "
+            "trimming older messages. Try starting a new conversation, turning "
+            "on \"2x Context\" and restarting the model, or switching to a "
+            "model with a larger context window."
+        )
+    return (
+        "The AI model reported an error and couldn't finish this response. "
+        f"Check llama_server.log for the technical details. "
+        f"({message or 'no further detail given'})"
+    )
+
+
 @app.post("/api/chat")
 async def chat(request: ChatRequest, background_tasks: BackgroundTasks):
     """
@@ -2063,6 +2235,17 @@ async def chat(request: ChatRequest, background_tasks: BackgroundTasks):
     else:
         history_for_model.insert(0, {"role": "system", "content": combined_system_message})
 
+    # Budget against the ACTUAL context window the running model was
+    # launched with (see LlamaServerManager.context_length), not a
+    # guess — trims oldest turns first so a long conversation degrades
+    # gracefully instead of hard-failing. Falls back to the original,
+    # pre-fix default (2048) only if a model was somehow never started
+    # through start() at all, which shouldn't happen in practice.
+    context_length = llama_manager.context_length or 2048
+    history_for_model, history_was_trimmed = await _fit_history_to_context(
+        history_for_model, context_length
+    )
+
     payload = {"messages": history_for_model}
 
     async with httpx.AsyncClient(timeout=900.0) as client:
@@ -2088,10 +2271,7 @@ async def chat(request: ChatRequest, background_tasks: BackgroundTasks):
                         "It may still be loading the model.",
             )
         except httpx.HTTPStatusError as e:
-            raise HTTPException(
-                status_code=502,
-                detail=f"llama_cpp.server returned an error: {e.response.text}",
-            )
+            raise HTTPException(status_code=502, detail=_friendly_llama_error(e))
 
     result = response.json()
     raw_content = result["choices"][0]["message"]["content"]
@@ -2200,15 +2380,34 @@ async def chat(request: ChatRequest, background_tasks: BackgroundTasks):
                                 f"Now answer the original question using this file content.",
                 },
             ]
-            follow_up_payload = {"messages": follow_up_messages}
-            async with httpx.AsyncClient(timeout=900.0) as follow_up_client:
-                follow_up_response = await follow_up_client.post(
-                    f"{LLAMA_SERVER_URL}/v1/chat/completions", json=follow_up_payload
-                )
-                follow_up_response.raise_for_status()
-            assistant_content = (
-                follow_up_response.json()["choices"][0]["message"]["content"].strip()
+            # The file's real content can itself be large enough to blow
+            # the same context budget the original request was just fit
+            # to — re-trim rather than assume history_for_model already
+            # being in-budget still holds once a whole file is appended.
+            follow_up_messages, _ = await _fit_history_to_context(
+                follow_up_messages, context_length
             )
+            follow_up_payload = {"messages": follow_up_messages}
+            try:
+                async with httpx.AsyncClient(timeout=900.0) as follow_up_client:
+                    follow_up_response = await follow_up_client.post(
+                        f"{LLAMA_SERVER_URL}/v1/chat/completions", json=follow_up_payload
+                    )
+                    follow_up_response.raise_for_status()
+                assistant_content = (
+                    follow_up_response.json()["choices"][0]["message"]["content"].strip()
+                )
+            except httpx.HTTPStatusError as e:
+                assistant_content = (
+                    f"{assistant_content}\n\n[Could not read {action_path} back to you: "
+                    f"{_friendly_llama_error(e)}]"
+                )
+            except (httpx.ConnectError, httpx.ReadTimeout):
+                assistant_content = (
+                    f"{assistant_content}\n\n[Could not reach the model to read "
+                    f"{action_path} back to you — it may still be busy or have "
+                    f"crashed. Check llama_server.log.]"
+                )
 
     assistant_timestamp = datetime.now(timezone.utc).isoformat()
     conversation["messages"].append({
@@ -2233,6 +2432,7 @@ async def chat(request: ChatRequest, background_tasks: BackgroundTasks):
         "reasoning": reasoning,
         "timestamp": assistant_timestamp,
         "usage": result.get("usage", {}),
+        "history_trimmed": history_was_trimmed,
     }
 
 
@@ -2270,6 +2470,7 @@ async def health():
         "llama_cpp_server": llama_status,
         "active_model": llama_manager.current_model_path,
         "extended_context": llama_manager.extended_context,
+        "context_length": llama_manager.context_length,
         "loading_elapsed_seconds": loading_elapsed_seconds,
     }
 
