@@ -1256,31 +1256,77 @@ def delete_project_file(project_id: str, file_path: str):
 
 # ---- Conversation persistence (scoped to a project) ----
 
+# Bumped whenever _chunk_text's algorithm changes, so a chunk cache
+# written by an older version gets treated as stale and re-chunked —
+# without this, fixing the chunker wouldn't actually change anything
+# for an already-cached file, since the cache is otherwise keyed only
+# on the source file's mtime (see _get_belief_chunks /
+# _get_project_document_chunks).
+_CHUNKER_VERSION = 2
+
+_SENTENCE_BOUNDARY_RE = re.compile(r"(?<=[.!?])\s+")
+
+
 def _chunk_text(text: str, chunk_size: int = 800, overlap: int = 100) -> list[str]:
     """
-    Split extracted text into passage-sized chunks for citation. Whole
-    documents are useless for retrieval — you need to point at a specific
-    relevant passage, not hand the model an entire book. Chunks overlap
-    slightly so a passage that would otherwise get split awkwardly across
-    a chunk boundary still appears intact in at least one chunk.
+    Split extracted text into passage-sized chunks for citation, cutting
+    only at sentence boundaries — never mid-word or mid-sentence.
 
-    This is a plain character-count split, not a verse-aware or
-    sentence-aware one — it doesn't know where a chapter or verse
-    boundary is. Good enough for keyword-based retrieval to find
-    relevant text; not precise enough to guarantee a chunk starts and
-    ends exactly on a verse boundary.
+    The original version of this did a plain text[start:end] character
+    slice, which regularly cut chunks off mid-word at both ends —
+    confirmed in real use feeding the model passages like "ast day,
+    that great day..." (a cut "last day") and "...they believed the
+    scripture... But Jesus did not commit him" (cut mid-sentence, the
+    rest silently missing) as if they were genuine, complete quotable
+    material. The model then dutifully tried to work these broken
+    fragments into its own replies, producing exactly the kind of
+    garbled, sentence-fragment output reported live ("...respect for
+    their beliefs …n him by force to make him king."). Whole documents
+    are still useless for retrieval — you need to point at a specific
+    passage, not hand the model an entire book — but every chunk now
+    starts and ends on a real sentence, so whatever gets quoted is at
+    least a genuine, complete thought.
+
+    Sentences are packed greedily up to chunk_size rather than split at
+    a fixed length; a single sentence longer than chunk_size on its own
+    (real for dense legal/scripture text) is kept whole rather than cut
+    — a passage a bit over the target length beats one broken mid-word.
+    Chunks still overlap by carrying the trailing sentences of one chunk
+    into the start of the next, so a passage near a boundary still
+    appears intact in at least one chunk.
     """
     text = re.sub(r"\s+", " ", text).strip()
     if not text:
         return []
 
-    chunks = []
-    start = 0
-    while start < len(text):
-        end = start + chunk_size
-        chunks.append(text[start:end].strip())
-        start = end - overlap
-    return [c for c in chunks if c]
+    sentences = [s.strip() for s in _SENTENCE_BOUNDARY_RE.split(text) if s.strip()]
+    if not sentences:
+        return []
+
+    chunks: list[str] = []
+    current: list[str] = []
+    current_len = 0
+    for sentence in sentences:
+        if current and current_len + len(sentence) + 1 > chunk_size:
+            chunks.append(" ".join(current))
+            # Carry enough trailing sentences into the next chunk to
+            # cover the requested overlap.
+            carried: list[str] = []
+            carried_len = 0
+            for s in reversed(current):
+                if carried_len >= overlap:
+                    break
+                carried.insert(0, s)
+                carried_len += len(s) + 1
+            current = carried
+            current_len = sum(len(s) + 1 for s in current)
+        current.append(sentence)
+        current_len += len(sentence) + 1
+
+    if current:
+        chunks.append(" ".join(current))
+
+    return chunks
 
 
 def _extract_pdf_text(path: Path) -> str:
@@ -1315,7 +1361,7 @@ def _get_belief_chunks(source_path: Path) -> list[str]:
 
     if cache_path.exists():
         cached = json.loads(cache_path.read_text(encoding="utf-8"))
-        if cached.get("source_mtime") == source_mtime:
+        if cached.get("source_mtime") == source_mtime and cached.get("chunker_version") == _CHUNKER_VERSION:
             return cached["chunks"]
 
     if source_path.suffix.lower() == ".pdf":
@@ -1327,7 +1373,10 @@ def _get_belief_chunks(source_path: Path) -> list[str]:
 
     chunks = _chunk_text(raw_text)
     cache_path.write_text(
-        json.dumps({"source_mtime": source_mtime, "chunks": chunks}, indent=2),
+        json.dumps(
+            {"source_mtime": source_mtime, "chunker_version": _CHUNKER_VERSION, "chunks": chunks},
+            indent=2,
+        ),
         encoding="utf-8",
     )
     return chunks
@@ -1355,7 +1404,7 @@ def _get_project_document_chunks(project_id: str, source_path: Path) -> list[str
 
     if cache_path.exists():
         cached = json.loads(cache_path.read_text(encoding="utf-8"))
-        if cached.get("source_mtime") == source_mtime:
+        if cached.get("source_mtime") == source_mtime and cached.get("chunker_version") == _CHUNKER_VERSION:
             return cached["chunks"]
 
     if source_path.suffix.lower() == ".pdf":
@@ -1367,7 +1416,10 @@ def _get_project_document_chunks(project_id: str, source_path: Path) -> list[str
 
     chunks = _chunk_text(raw_text)
     cache_path.write_text(
-        json.dumps({"source_mtime": source_mtime, "chunks": chunks}, indent=2),
+        json.dumps(
+            {"source_mtime": source_mtime, "chunker_version": _CHUNKER_VERSION, "chunks": chunks},
+            indent=2,
+        ),
         encoding="utf-8",
     )
     return chunks
@@ -2046,6 +2098,37 @@ async def _fit_history_to_context(
     return result, trimmed
 
 
+_SENTENCE_END_RE = re.compile(r"[.!?][\"'\)\]]*(?:\s|$)")
+
+
+def _trim_to_last_sentence_boundary(text: str) -> str:
+    """
+    Cut truncated model output back to its last complete sentence,
+    discarding whatever incomplete sentence trails after it. Used before
+    asking the model to continue a reply that got cut off mid-generation
+    — confirmed in real testing that asking a model (Gemma specifically)
+    to literally "continue where you left off" from a broken mid-word or
+    mid-sentence fragment often doesn't work: it starts a new sentence
+    that doesn't grammatically connect to the cut point, producing
+    garbled text like "...respect for their beliefs …n him by force
+    to make him king." Handing it a clean sentence boundary instead
+    means its continuation is a normal new sentence, which is what
+    stitches together correctly.
+
+    Falls back to the last whitespace if no sentence-ending punctuation
+    is found at all (so a mid-WORD break at least never survives), and
+    to the untouched text only if there's no whitespace either — nothing
+    safe left to cut.
+    """
+    matches = list(_SENTENCE_END_RE.finditer(text))
+    if matches:
+        return text[: matches[-1].end()].rstrip()
+    last_space = text.rfind(" ")
+    if last_space > 0:
+        return text[:last_space].rstrip()
+    return text
+
+
 def _friendly_llama_error(e: httpx.HTTPStatusError) -> str:
     """
     Turn whatever llama_cpp.server sent back into a plain-English message
@@ -2314,11 +2397,22 @@ async def chat(request: ChatRequest, background_tasks: BackgroundTasks):
             if finish_reason != "length":
                 break  # the model actually finished on its own — done
 
+            # Don't hand the model (or the final stitched reply) a broken
+            # mid-sentence fragment to build on — cut back to the last
+            # complete sentence first, discarding the incomplete tail, so
+            # the next round starts a clean new sentence instead of being
+            # asked to complete a graft point it may just ignore.
+            kept = _trim_to_last_sentence_boundary(piece)
+            if kept:
+                assistant_pieces[-1] = kept
+            else:
+                kept = piece  # nothing safe to cut — keep the raw piece rather than lose it entirely
+
             current_messages = current_messages + [
-                {"role": "assistant", "content": piece},
+                {"role": "assistant", "content": kept},
                 {"role": "user", "content": (
-                    "Continue your previous response exactly where it left off. "
-                    "Do not repeat anything you already said, and do not add any "
+                    "Continue your response with what comes next. Do not "
+                    "repeat anything you already said, and do not add any "
                     "new preamble or greeting."
                 )},
             ]
