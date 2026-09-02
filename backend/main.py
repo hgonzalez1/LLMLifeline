@@ -1931,6 +1931,22 @@ async def _title_background_task(project_id: str, conversation_id: str, first_me
 
 # ---- Chat proxy ----
 
+# Per-generation-call token budget: how many tokens of headroom
+# _fit_history_to_context reserves for a reply when trimming the input,
+# AND the max_tokens cap actually requested per generation call below.
+# Kept as one shared constant so those two things can't drift apart —
+# reserving room while trimming the prompt only matters if the request
+# then actually asks for that much room back.
+RESPONSE_TOKEN_RESERVE = 1024
+
+# How many extra "keep going" calls /api/chat will make automatically
+# when a reply gets cut off by hitting RESPONSE_TOKEN_RESERVE mid-answer
+# (finish_reason "length") before giving up and saying so plainly. Caps
+# worst-case latency/cost for a single request rather than looping
+# forever on a model that just keeps generating.
+MAX_CONTINUATION_ROUNDS = 4
+
+
 async def _real_token_count(text: str) -> int | None:
     """
     Ask the running llama_cpp.server to tokenize text with the actual
@@ -1997,9 +2013,8 @@ async def _fit_history_to_context(
     whose messages don't strictly alternate user/assistant — dropping a
     single message from the middle of a pair would break that.
     """
-    RESPONSE_RESERVE = 512  # leave room for the model's own reply
-    SAFETY_MARGIN = 64      # chat-template formatting adds a little overhead this doesn't capture by summing raw content alone
-    budget = max(context_length - RESPONSE_RESERVE - SAFETY_MARGIN, 256)
+    SAFETY_MARGIN = 64  # chat-template formatting adds a little overhead this doesn't capture by summing raw content alone
+    budget = max(context_length - RESPONSE_TOKEN_RESERVE - SAFETY_MARGIN, 256)
 
     has_system = bool(history_for_model) and history_for_model[0]["role"] == "system"
     system_msg = history_for_model[0] if has_system else None
@@ -2246,35 +2261,94 @@ async def chat(request: ChatRequest, background_tasks: BackgroundTasks):
         history_for_model, context_length
     )
 
-    payload = {"messages": history_for_model}
+    # Generate the reply. llama_cpp.server defaults an unset max_tokens to
+    # "fill whatever's left of the context window" — which, combined with
+    # never checking finish_reason, is what let a cut-off answer through
+    # silently before this fix (a reply is only "done" when the model
+    # actually stopped on its own; hitting the token cap mid-sentence is
+    # a different, distinguishable outcome — OpenAI-style APIs report it
+    # via finish_reason == "length"). When that happens, ask the model to
+    # keep going from exactly where it stopped and stitch the pieces
+    # together, up to MAX_CONTINUATION_ROUNDS times, rather than ever
+    # showing a silently-truncated answer as if it were complete.
+    current_messages = list(history_for_model)
+    assistant_pieces: list[str] = []
+    finish_reason = None
+    cumulative_usage: dict = {}
 
     async with httpx.AsyncClient(timeout=900.0) as client:
-        try:
-            response = await client.post(
-                f"{LLAMA_SERVER_URL}/v1/chat/completions",
-                json=payload,
-            )
-            response.raise_for_status()
-        except httpx.ReadTimeout:
-            raise HTTPException(
-                status_code=504,
-                detail="The model is still generating a response after 15 minutes. "
-                        "This can happen with long/complex requests on slower models, "
-                        "especially with reasoning enabled. The generation may still "
-                        "complete on the model server even though this request gave up — "
-                        "check llama_server.log.",
-            )
-        except httpx.ConnectError:
-            raise HTTPException(
-                status_code=503,
-                detail="Cannot reach llama_cpp.server even though the process is alive. "
-                        "It may still be loading the model.",
-            )
-        except httpx.HTTPStatusError as e:
-            raise HTTPException(status_code=502, detail=_friendly_llama_error(e))
+        for _round in range(MAX_CONTINUATION_ROUNDS + 1):
+            try:
+                response = await client.post(
+                    f"{LLAMA_SERVER_URL}/v1/chat/completions",
+                    json={"messages": current_messages, "max_tokens": RESPONSE_TOKEN_RESERVE},
+                )
+                response.raise_for_status()
+            except httpx.ReadTimeout:
+                raise HTTPException(
+                    status_code=504,
+                    detail="The model is still generating a response after 15 minutes. "
+                            "This can happen with long/complex requests on slower models, "
+                            "especially with reasoning enabled. The generation may still "
+                            "complete on the model server even though this request gave up — "
+                            "check llama_server.log.",
+                )
+            except httpx.ConnectError:
+                raise HTTPException(
+                    status_code=503,
+                    detail="Cannot reach llama_cpp.server even though the process is alive. "
+                            "It may still be loading the model.",
+                )
+            except httpx.HTTPStatusError as e:
+                raise HTTPException(status_code=502, detail=_friendly_llama_error(e))
 
-    result = response.json()
-    raw_content = result["choices"][0]["message"]["content"]
+            result = response.json()
+            choice = result["choices"][0]
+            piece = choice["message"]["content"]
+            finish_reason = choice.get("finish_reason")
+            assistant_pieces.append(piece)
+            for k, v in result.get("usage", {}).items():
+                if isinstance(v, (int, float)):
+                    cumulative_usage[k] = cumulative_usage.get(k, 0) + v
+
+            if finish_reason != "length":
+                break  # the model actually finished on its own — done
+
+            current_messages = current_messages + [
+                {"role": "assistant", "content": piece},
+                {"role": "user", "content": (
+                    "Continue your previous response exactly where it left off. "
+                    "Do not repeat anything you already said, and do not add any "
+                    "new preamble or greeting."
+                )},
+            ]
+            # The growing continuation transcript can itself outgrow the
+            # context budget — re-fit before every further call, same as
+            # the original request was.
+            current_messages, _ = await _fit_history_to_context(current_messages, context_length)
+
+    # Plain "".join() glues pieces together with nothing between them —
+    # confirmed in testing that a hard max_tokens cutoff can land
+    # mid-word, producing "...vibrant fish" + "to the inky..." joined
+    # into "fishto...". Insert a single space at a seam only when
+    # neither side already has one, so a cut that happened to land on a
+    # real word/space boundary isn't touched.
+    raw_content = ""
+    for piece in assistant_pieces:
+        if raw_content and piece and not raw_content[-1].isspace() and not piece[0].isspace():
+            raw_content += " "
+        raw_content += piece
+    response_cut_short = finish_reason == "length"
+    if response_cut_short:
+        # Still truncated after every automatic continuation attempt —
+        # say so plainly rather than saving/showing a partial answer with
+        # nothing indicating it isn't the whole thing.
+        raw_content += (
+            "\n\n*[This reply was cut short even after being continued "
+            "automatically several times — it kept filling the model's "
+            "available context. Try asking in smaller pieces, start a new "
+            "conversation, or turn on \"2x Context\" and restart the model.]*"
+        )
 
     # Strip a leading <think>...</think> block if present. This does NOT
     # reduce generation time or token cost — the model still generates the
@@ -2387,16 +2461,27 @@ async def chat(request: ChatRequest, background_tasks: BackgroundTasks):
             follow_up_messages, _ = await _fit_history_to_context(
                 follow_up_messages, context_length
             )
-            follow_up_payload = {"messages": follow_up_messages}
+            follow_up_payload = {"messages": follow_up_messages, "max_tokens": RESPONSE_TOKEN_RESERVE}
             try:
                 async with httpx.AsyncClient(timeout=900.0) as follow_up_client:
                     follow_up_response = await follow_up_client.post(
                         f"{LLAMA_SERVER_URL}/v1/chat/completions", json=follow_up_payload
                     )
                     follow_up_response.raise_for_status()
-                assistant_content = (
-                    follow_up_response.json()["choices"][0]["message"]["content"].strip()
-                )
+                follow_up_choice = follow_up_response.json()["choices"][0]
+                assistant_content = follow_up_choice["message"]["content"].strip()
+                if follow_up_choice.get("finish_reason") == "length":
+                    # Same truncation guarantee as the main reply — this
+                    # secondary call doesn't get the multi-round
+                    # continuation loop (it's already a follow-up), so
+                    # just say plainly that it was cut short.
+                    response_cut_short = True
+                    assistant_content += (
+                        "\n\n*[This reply was cut short — reading the file back left "
+                        "too little room in the model's context for a full answer. "
+                        "Try a shorter file, a new conversation, or turn on "
+                        "\"2x Context\" and restart the model.]*"
+                    )
             except httpx.HTTPStatusError as e:
                 assistant_content = (
                     f"{assistant_content}\n\n[Could not read {action_path} back to you: "
@@ -2431,8 +2516,9 @@ async def chat(request: ChatRequest, background_tasks: BackgroundTasks):
         "reply": assistant_content,
         "reasoning": reasoning,
         "timestamp": assistant_timestamp,
-        "usage": result.get("usage", {}),
+        "usage": cumulative_usage,
         "history_trimmed": history_was_trimmed,
+        "response_cut_short": response_cut_short,
     }
 
 
