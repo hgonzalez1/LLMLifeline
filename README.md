@@ -6,6 +6,8 @@ Chat with a local AI model, organize conversations into projects, generate image
 
 **New here?** This page covers day-to-day use. For installing it the first time, see **[setup-guide.md](setup-guide.md)** — the short version is: run `start.bat` (or double-click `LLMlifeline.exe`), and everything else, including your first set of AI models, sets itself up automatically.
 
+Video Description
+https://www.instagram.com/p/DczP_zttc8v/
 ---
 
 ## Using LLMlifeline
