@@ -1,0 +1,145 @@
+name: Release builds
+
+# Builds LLMlifeline for Windows (.zip with LLMlifeline.exe), macOS
+# (.dmg, Apple Silicon) and Linux (.tar.gz) from launcher.py with
+# PyInstaller, the same tool build_exe.bat uses. Pushing a v* tag also
+# attaches the builds to a GitHub Release; running it by hand from the
+# Actions tab only produces them as workflow artifacts.
+#
+# None of these bundle torch/ComfyUI/models — exactly like the Windows
+# exe, the launcher sets those up in llm-env on first run.
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+jobs:
+  macos:
+    runs-on: macos-latest  # Apple Silicon (arm64)
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: python -m pip install pyinstaller
+
+      # The .app carries a copy of the project ("payload"); on launch it
+      # fills ~/LLMlifeline from it, since nothing can be written inside
+      # an app bundle. See launcher.py's APP_ROOT / install_bundled_project.
+      - name: Build LLMlifeline.app
+        run: |
+          python -m PyInstaller --windowed --onedir --name LLMlifeline \
+            --osx-bundle-identifier io.github.hgonzalez1.llmlifeline \
+            --add-data "backend:payload/backend" \
+            --add-data "frontend:payload/frontend" \
+            --add-data "beliefs:payload/beliefs" \
+            --add-data "persona.txt:payload" \
+            --add-data "download_models.py:payload" \
+            --add-data "README.md:payload" \
+            --add-data "setup-guide.md:payload" \
+            launcher.py
+          # Ad-hoc signature only (no Apple Developer ID): Apple Silicon
+          # refuses to run unsigned code at all, but Gatekeeper still
+          # warns on first open. See packaging/macos/How to open LLMlifeline.txt.
+          codesign --force --deep --sign - dist/LLMlifeline.app
+
+      - name: Self-test the app
+        run: |
+          export HOME="$RUNNER_TEMP/home"
+          dist/LLMlifeline.app/Contents/MacOS/LLMlifeline --self-test
+          test -f "$HOME/LLMlifeline/backend/main.py"
+          test -f "$HOME/LLMlifeline/frontend/index.html"
+          test -f "$HOME/LLMlifeline/persona.txt"
+
+      - name: Build .dmg
+        run: |
+          mkdir dmg
+          cp -R dist/LLMlifeline.app dmg/
+          ln -s /Applications dmg/Applications
+          cp "packaging/macos/How to open LLMlifeline.txt" dmg/
+          # hdiutil on hosted runners fails now and then with "Resource busy".
+          for attempt in 1 2 3; do
+            hdiutil create -volname LLMlifeline -srcfolder dmg -ov -format UDZO \
+              LLMlifeline-macos-arm64.dmg && break
+            sleep 10
+          done
+          test -f LLMlifeline-macos-arm64.dmg
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: macos
+          path: LLMlifeline-macos-arm64.dmg
+
+  linux:
+    runs-on: ubuntu-22.04  # older glibc, so the binary runs on more distros
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: python -m pip install pyinstaller
+      - run: python -m PyInstaller --onefile --console --name LLMlifeline launcher.py
+
+      # Same shape as the Windows download: the project folder with the
+      # launcher binary sitting in it.
+      - name: Package
+        run: |
+          mkdir stage
+          git archive --prefix=LLMlifeline/ HEAD | tar -x -C stage
+          rm -rf stage/LLMlifeline/.github stage/LLMlifeline/packaging stage/LLMlifeline/*.bat
+          cp dist/LLMlifeline stage/LLMlifeline/
+          stage/LLMlifeline/LLMlifeline --self-test
+          tar -czf LLMlifeline-linux-x86_64.tar.gz -C stage LLMlifeline
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux
+          path: LLMlifeline-linux-x86_64.tar.gz
+
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: python -m pip install pyinstaller
+      - run: python -m PyInstaller --onefile --console --name LLMlifeline launcher.py
+
+      # Copied from the checkout (not git archive) so the .bat files keep
+      # the CRLF line endings cmd.exe needs.
+      - name: Package
+        shell: bash
+        run: |
+          mkdir -p stage/LLMlifeline
+          git ls-files -z | tar --null -T - -cf - | tar -xf - -C stage/LLMlifeline
+          rm -rf stage/LLMlifeline/.github stage/LLMlifeline/packaging
+          cp dist/LLMlifeline.exe stage/LLMlifeline/
+          stage/LLMlifeline/LLMlifeline.exe --self-test
+          cd stage && 7z a -tzip ../LLMlifeline-windows-x64.zip LLMlifeline
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows
+          path: LLMlifeline-windows-x64.zip
+
+  release:
+    # Publishes whatever built, as long as the Mac build did — one broken
+    # platform shouldn't hold back the others.
+    if: ${{ !cancelled() && startsWith(github.ref, 'refs/tags/v') && needs.macos.result == 'success' }}
+    needs: [macos, linux, windows]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: assets
+          merge-multiple: true
+      - uses: softprops/action-gh-release@v2
+        with:
+          name: LLMlifeline ${{ github.ref_name }}
+          body_path: packaging/RELEASE_NOTES.md
+          files: assets/*

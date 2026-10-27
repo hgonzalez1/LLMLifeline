@@ -1,0 +1,40 @@
+LLMlifeline for Mac (Apple Silicon: M1 or newer)
+================================================
+
+1. Drag LLMlifeline into the Applications folder.
+
+2. Before you open it the first time, install two things:
+   - Apple's Command Line Tools. Open Terminal and run:
+       xcode-select --install
+   - Python 3.10 (3.11 to 3.13 also work) from
+       https://www.python.org/downloads/macos/
+     The python3 that comes with macOS is 3.9, which is too old.
+
+3. Let macOS open it. This app is not signed with an Apple Developer ID,
+   so macOS blocks it the first time. The most reliable fix is one
+   Terminal command:
+       xattr -dr com.apple.quarantine /Applications/LLMlifeline.app
+   Then double-click LLMlifeline normally.
+
+   Without Terminal:
+   - macOS 15 or newer: double-click LLMlifeline, click Done on the
+     warning, open System Settings > Privacy & Security, scroll down,
+     click "Open Anyway" next to LLMlifeline, and confirm.
+   - macOS 14 or older: Control-click LLMlifeline, choose Open, then Open.
+   If a second warning appears when the Terminal window opens, use the
+   xattr command above.
+
+4. LLMlifeline opens a Terminal window and sets itself up in a folder
+   called LLMlifeline in your home folder. The first run takes a while:
+   it installs its Python packages, downloads ComfyUI (about 6-7 GB),
+   and downloads the default AI models (about 49 GB). Press Ctrl+C during
+   the model download to skip it and add your own .gguf files to
+   ~/LLMlifeline/models instead. When it's ready, your browser opens to
+   http://127.0.0.1:8001/.
+
+5. To quit, click Stop in the app. If that isn't reachable, run in Terminal:
+       lsof -t -iTCP:8000 -iTCP:8001 -iTCP:8188 -sTCP:LISTEN | xargs kill
+
+Your conversations, persona.txt, beliefs and models all live in
+~/LLMlifeline. Nothing is uploaded anywhere. Deleting the app leaves
+that folder in place.

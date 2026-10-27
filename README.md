@@ -4,7 +4,7 @@
 
 Chat with a local AI model, organize conversations into projects, generate images, and shape how the assistant talks and what it knows — all through one simple screen.
 
-**New here?** This page covers day-to-day use. For installing it the first time, see **[setup-guide.md](setup-guide.md)** — the short version is: run `start.bat` (or double-click `LLMlifeline.exe`), and everything else, including your first set of AI models, sets itself up automatically.
+**New here?** This page covers day-to-day use. For installing it the first time, see **[setup-guide.md](setup-guide.md)** — the short version is: run `start.bat` (or double-click `LLMlifeline.exe`), and everything else, including your first set of AI models, sets itself up automatically. On a Mac or Linux, grab the `.dmg` or `.tar.gz` from the [Releases page](https://github.com/hgonzalez1/LLMLifeline/releases).
 
 Video Description
 https://www.instagram.com/p/DczP_zttc8v/

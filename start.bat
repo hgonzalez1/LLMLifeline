@@ -172,6 +172,11 @@ if errorlevel 1 (
     echo   Missing: llama-cpp-python
     set NEEDS_INSTALL=1
 )
+"%VENV_PYTHON%" -c "import sse_starlette" 2>nul
+if errorlevel 1 (
+    echo   Missing: llama-cpp-python server extras (needed to run chat models^)
+    set NEEDS_INSTALL=1
+)
 "%VENV_PYTHON%" -c "import pypdf" 2>nul
 if errorlevel 1 (
     echo   Missing: pypdf
@@ -257,6 +262,24 @@ if errorlevel 1 (
     echo   torch CUDA: OK
 )
 echo.
+
+REM ---- ComfyUI's own packages ----
+REM ComfyUI\requirements.txt (frontend package, torchsde, einops, av...)
+REM isn't covered by backend\requirements.txt, so a fresh machine never
+REM got it. Runs after the torch step so pip keeps the CUDA build.
+REM Not fatal: chat still works without it. Same as launcher.py's
+REM ensure_comfyui_dependencies.
+"%VENV_PYTHON%" -c "import comfyui_frontend_package, torchsde, einops, av" 2>nul
+if errorlevel 1 (
+    echo Installing ComfyUI's own packages. This is a one-time step.
+    "%VENV_PYTHON%" -m pip install --break-system-packages -r "%CD%\ComfyUI\requirements.txt"
+    if errorlevel 1 (
+        echo.
+        echo WARNING: ComfyUI's packages did not install. Chat will still work;
+        echo Image Model will not until this is resolved. See output above.
+    )
+    echo.
+)
 
 REM ---- Default model download (first run only, ever) ----
 REM GGUF/safetensors files are too large for GitHub, so instead of

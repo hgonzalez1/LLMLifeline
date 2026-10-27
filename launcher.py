@@ -32,6 +32,10 @@ import time
 import webbrowser
 from pathlib import Path
 
+IS_WINDOWS = sys.platform == "win32"
+IS_MAC = sys.platform == "darwin"
+FROZEN = getattr(sys, "frozen", False)
+
 # PyInstaller's --onefile bootloader extracts the frozen script to a
 # temp directory at runtime and runs it FROM there — __file__ inside a
 # frozen build resolves to that temp extraction, not to where
@@ -39,11 +43,23 @@ from pathlib import Path
 # real path in that case; __file__ is only correct when running this
 # as a plain .py script (not frozen). Confirmed the wrong branch here
 # breaks everything: it can't find backend/main.py at all when frozen.
-if getattr(sys, "frozen", False):
+#
+# The macOS .app is the exception: it lives in /Applications, and
+# writing llm-env, ComfyUI, models and conversations inside an app
+# bundle breaks it (macOS treats the bundle as read-only, signed code).
+# So the Mac build keeps the project folder at ~/LLMlifeline instead,
+# filled from a copy of the project bundled inside the .app (see
+# install_bundled_project).
+if IS_MAC and FROZEN:
+    APP_ROOT = Path.home() / "LLMlifeline"
+elif FROZEN:
     APP_ROOT = Path(sys.executable).resolve().parent
 else:
     APP_ROOT = Path(__file__).resolve().parent
-VENV_PYTHON = APP_ROOT / "llm-env" / "Scripts" / "python.exe"
+if IS_WINDOWS:
+    VENV_PYTHON = APP_ROOT / "llm-env" / "Scripts" / "python.exe"
+else:
+    VENV_PYTHON = APP_ROOT / "llm-env" / "bin" / "python"
 BACKEND_DIR = APP_ROOT / "backend"
 BACKEND_MAIN = BACKEND_DIR / "main.py"
 REQUIREMENTS = BACKEND_DIR / "requirements.txt"
@@ -105,10 +121,15 @@ def _check_torch_cuda_current() -> bool:
     # CUDA-enabled torch still "has CUDA" but crashes ComfyUI on import.
     # Confirmed and fixed on the original dev machine by reinstalling
     # from https://download.pytorch.org/whl/cu126 (2.7.1).
+    #
+    # Macs have no CUDA at all — their GPU path is Metal (MPS), which
+    # every PyPI torch build for macOS already includes — so there it's
+    # the version check only.
+    cuda_check = "" if IS_MAC else "torch.cuda.is_available() and "
     code = (
         "import torch; from packaging.version import Version; "
-        "exit(0 if torch.cuda.is_available() "
-        "and Version(torch.__version__.split('+')[0]) >= Version('2.7.0') else 1)"
+        f"exit(0 if {cuda_check}"
+        "Version(torch.__version__.split('+')[0]) >= Version('2.7.0') else 1)"
     )
     return _run([str(VENV_PYTHON), "-c", code], capture=True).returncode == 0
 
@@ -130,7 +151,19 @@ def _find_system_python() -> list[str] | None:
     resolves to on PATH — not a hard requirement of exactly 3.10, since
     most of this project's dependencies publish wheels for a wide version
     range; ensure_venv prints a heads-up when it falls back like this.
+
+    On macOS/Linux there's no `py` launcher, so it tries versioned
+    python3.x names, 3.10 first, and rejects anything older than 3.10 —
+    macOS's own /usr/bin/python3 is 3.9, which this project can't use.
     """
+    if not IS_WINDOWS:
+        for name in ("python3.10", "python3.11", "python3.12", "python3.13", "python3"):
+            exe = shutil.which(name)
+            if exe and _run([exe, "-c", "import sys; exit(0 if sys.version_info >= (3, 10) else 1)"],
+                            capture=True).returncode == 0:
+                return [exe]
+        return None
+
     py_launcher = shutil.which("py")
     if py_launcher and _run([py_launcher, "-3.10", "--version"], capture=True).returncode == 0:
         return [py_launcher, "-3.10"]
@@ -172,10 +205,16 @@ def ensure_venv():
     if system_python is None:
         print("ERROR: No Python installation found on this machine.")
         print("Install Python 3.10 from https://www.python.org/downloads/")
-        print('(check "Add python.exe to PATH" during install), then run this again.')
+        if IS_WINDOWS:
+            print('(check "Add python.exe to PATH" during install), then run this again.')
+        elif IS_MAC:
+            print("(macOS's built-in python3 is 3.9, which is too old), then run this again.")
+        else:
+            print("or your package manager (e.g. sudo apt install python3 python3-venv),")
+            print("then run this again.")
         _pause_and_exit()
 
-    if "-3.10" not in system_python:
+    if system_python[-1] != "-3.10" and not system_python[-1].endswith("python3.10"):
         print('  NOTE: Python 3.10 specifically wasn\'t found - using whatever')
         print('  "python" resolves to on PATH instead. This project was built and')
         print("  tested against 3.10; most dependencies publish wheels for a wide")
@@ -186,6 +225,9 @@ def ensure_venv():
     result = _run(system_python + ["-m", "venv", str(venv_dir)])
     if result.returncode != 0:
         print("\nERROR: Could not create the virtual environment. See output above.")
+        if not IS_WINDOWS and not IS_MAC:
+            print("On Debian/Ubuntu this usually means the venv module isn't installed:")
+            print("  sudo apt install python3-venv")
         _pause_and_exit()
     print("  Virtual environment created.")
     print()
@@ -203,7 +245,11 @@ def ensure_comfyui():
     git = shutil.which("git")
     if git is None:
         print("ERROR: git is not installed or not on PATH.")
-        print("Install it from https://git-scm.com/downloads, then run this again.")
+        if IS_MAC:
+            print("Install Apple's Command Line Tools with: xcode-select --install")
+            print("then run this again.")
+        else:
+            print("Install it from https://git-scm.com/downloads, then run this again.")
         _pause_and_exit()
 
     if comfyui_dir.exists():
@@ -256,6 +302,7 @@ def ensure_dependencies():
         "httpx": "httpx",
         "multipart": "python-multipart (needed for image/document uploads)",
         "llama_cpp": "llama-cpp-python",
+        "sse_starlette": "llama-cpp-python server extras (needed to run chat models)",
         "pypdf": "pypdf",
         "comfy_kitchen": "comfy_kitchen",
     }
@@ -276,15 +323,28 @@ def ensure_dependencies():
             print("\nERROR: Dependency install failed. See output above.")
             _pause_and_exit()
         print()
-        print("NOTE: if llama-cpp-python was just installed fresh above, it is")
-        print("a CPU-only build by default and will run WITHOUT GPU")
-        print("acceleration. Rebuilding it with CUDA support requires the")
-        print("original CMAKE_ARGS build process, not this script - see setup-guide.md.")
+        if IS_MAC:
+            print("NOTE: on Apple Silicon, llama-cpp-python builds with Metal GPU")
+            print("acceleration on its own - nothing extra to do.")
+        else:
+            print("NOTE: if llama-cpp-python was just installed fresh above, it is")
+            print("a CPU-only build by default and will run WITHOUT GPU")
+            print("acceleration. Rebuilding it with CUDA support requires the")
+            print("original CMAKE_ARGS build process, not this script - see setup-guide.md.")
         print()
 
     print("Checking torch/CUDA status...")
     if _check_torch_cuda_current():
-        print("  torch CUDA: OK")
+        print("  torch CUDA: OK" if not IS_MAC else "  torch: OK")
+    elif IS_MAC:
+        print("  torch is missing or older than the 2.7.0 comfy_kitchen needs.")
+        print("  Installing it from PyPI (the Mac builds include Metal GPU support).")
+        print("  This is a large download and may take several minutes.")
+        result = _run([str(VENV_PYTHON), "-m", "pip", "install", "--upgrade",
+                       "torch>=2.7.0", "torchvision", "torchaudio"])
+        if result.returncode != 0:
+            print("\nERROR: torch install failed. See output above.")
+            print("ComfyUI image generation will not work until this is resolved.")
     else:
         print("  torch is missing, CPU-only, or older than the 2.7.0 comfy_kitchen")
         print("  needs. Installing a current CUDA-enabled build from PyTorch's")
@@ -304,6 +364,29 @@ def ensure_dependencies():
             print("  mismatch beyond what this script can fix automatically.")
         else:
             print("  torch CUDA install succeeded.")
+    print()
+
+
+def ensure_comfyui_dependencies():
+    """
+    ComfyUI's own requirements.txt (its frontend package, torchsde,
+    einops, av, ...) — none of which are in backend/requirements.txt, so
+    a fresh machine never got them and ComfyUI failed on import. Runs
+    after the torch step on purpose: torch is already installed by then,
+    so pip leaves the CUDA/Metal build alone instead of swapping in a
+    plain PyPI one. Not fatal if it fails — chat still works.
+    """
+    comfy_requirements = APP_ROOT / "ComfyUI" / "requirements.txt"
+    if not comfy_requirements.exists():
+        return
+    if all(_check_importable(m) for m in ("comfyui_frontend_package", "torchsde", "einops", "av")):
+        return
+    print("Installing ComfyUI's own packages. This is a one-time step.")
+    result = _run([str(VENV_PYTHON), "-m", "pip", "install",
+                   "--break-system-packages", "-r", str(comfy_requirements)])
+    if result.returncode != 0:
+        print("\nWARNING: ComfyUI's packages did not install. Chat will still work;")
+        print("Image Model will not until this is resolved. See output above.")
     print()
 
 
@@ -341,7 +424,55 @@ def wait_for_backend(timeout_seconds: int = 180) -> bool:
     return False
 
 
+def install_bundled_project():
+    """
+    Mac build only (the only one built with a bundled "payload" copy of
+    the project — see .github/workflows/release.yml): fills ~/LLMlifeline
+    from it. Code and docs are refreshed on every launch, so installing a
+    newer .app updates them; persona.txt and beliefs/ are the person's to
+    edit, so those are copied once and never overwritten.
+    """
+    payload = Path(getattr(sys, "_MEIPASS", "")) / "payload"
+    if not FROZEN or not payload.is_dir():
+        return
+    APP_ROOT.mkdir(parents=True, exist_ok=True)
+    (APP_ROOT / "models").mkdir(exist_ok=True)
+    for name, overwrite in (("backend", True), ("frontend", True), ("download_models.py", True),
+                            ("README.md", True), ("setup-guide.md", True),
+                            ("persona.txt", False), ("beliefs", False)):
+        src, dst = payload / name, APP_ROOT / name
+        if not src.exists() or (dst.exists() and not overwrite):
+            continue
+        if src.is_dir():
+            shutil.copytree(src, dst, dirs_exist_ok=True)
+        else:
+            shutil.copy2(src, dst)
+
+
+def _relaunch_in_terminal_if_needed():
+    """
+    A .app double-clicked in Finder has no console at all, and this
+    launcher's whole design is a visible console (see build_exe.bat's
+    --console note: first-run installs take minutes). So the Mac build
+    reopens itself in a Terminal window and lets this copy exit.
+    """
+    if IS_MAC and FROZEN and not (sys.stdin and sys.stdin.isatty()):
+        subprocess.run(["open", "-a", "Terminal", sys.executable])
+        sys.exit(0)
+
+
 def main():
+    # Used by the release workflow to prove a fresh build actually runs
+    # and can find (or install) the project files, without starting
+    # any downloads or servers.
+    if "--self-test" in sys.argv:
+        install_bundled_project()
+        ok = BACKEND_MAIN.exists()
+        print(f"LLMlifeline launcher self-test: APP_ROOT={APP_ROOT} backend={'found' if ok else 'MISSING'}")
+        sys.exit(0 if ok else 1)
+
+    _relaunch_in_terminal_if_needed()
+    install_bundled_project()
     os.chdir(APP_ROOT)
 
     if not BACKEND_MAIN.exists():
@@ -354,19 +485,26 @@ def main():
 
     ensure_comfyui()
     ensure_dependencies()
+    ensure_comfyui_dependencies()
     download_default_models()
     _warn_if_no_models()
 
     print(f"Starting backend on port {BACKEND_PORT}...")
-    startupinfo = subprocess.STARTUPINFO()
-    startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
-    startupinfo.wShowWindow = SW_MINIMIZE
-    subprocess.Popen(
-        [str(VENV_PYTHON), "-m", "uvicorn", "main:app",
-         "--app-dir", str(BACKEND_DIR), "--port", str(BACKEND_PORT)],
-        creationflags=subprocess.CREATE_NEW_CONSOLE,
-        startupinfo=startupinfo,
-    )
+    backend_cmd = [str(VENV_PYTHON), "-m", "uvicorn", "main:app",
+                   "--app-dir", str(BACKEND_DIR), "--port", str(BACKEND_PORT)]
+    if IS_WINDOWS:
+        startupinfo = subprocess.STARTUPINFO()
+        startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+        startupinfo.wShowWindow = SW_MINIMIZE
+        subprocess.Popen(backend_cmd, creationflags=subprocess.CREATE_NEW_CONSOLE,
+                         startupinfo=startupinfo)
+    else:
+        # No separate console window to hand it on macOS/Linux, so it
+        # runs detached (its own session, so closing this Terminal
+        # window doesn't take it down) and logs to backend.log instead.
+        backend_log = open(APP_ROOT / "backend.log", "ab")
+        subprocess.Popen(backend_cmd, stdout=backend_log, stderr=subprocess.STDOUT,
+                         stdin=subprocess.DEVNULL, start_new_session=True)
 
     print("Waiting for the backend to become ready (this can take a while on a")
     print("cold model load)...")
@@ -381,9 +519,15 @@ def main():
         print(f"{url} yourself once it settles.")
 
     print()
-    print("The backend is running in its own minimized console window.")
-    print("Closing THIS window is fine - use the Stop button in the browser")
-    print("page when you're done, or run stop.bat.")
+    if IS_WINDOWS:
+        print("The backend is running in its own minimized console window.")
+        print("Closing THIS window is fine - use the Stop button in the browser")
+        print("page when you're done, or run stop.bat.")
+    else:
+        print(f"The backend is running in the background (log: {APP_ROOT / 'backend.log'}).")
+        print("Closing THIS window is fine - use the Stop button in the browser")
+        print("page when you're done, or run this in Terminal:")
+        print("  lsof -t -iTCP:8000 -iTCP:8001 -iTCP:8188 -sTCP:LISTEN | xargs kill")
     print()
     try:
         input("Press Enter to close this window...")

@@ -2,7 +2,7 @@ fastapi
 uvicorn
 httpx
 python-multipart
-llama-cpp-python
+llama-cpp-python[server]
 pypdf
 numpy
 comfy_kitchen==0.2.31

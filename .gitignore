@@ -49,6 +49,10 @@ __pycache__/
 build/
 LLMlifeline.exe
 
+# Downloaded copies of the GitHub Release builds (.dmg/.zip/.tar.gz) —
+# the release itself is the source of truth; release.yml rebuilds them.
+/releases/
+
 # Scratch/leftover files from development that never belonged in the
 # shipped project — not code, not docs, just clutter that happened to
 # be sitting in this folder.
