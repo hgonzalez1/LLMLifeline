@@ -468,6 +468,123 @@
   }
   #modal-cancel { background: transparent; color: var(--muted); }
   #modal-create { background: var(--accent); color: white; }
+
+  /* ---- Computer use: tool steps, approval cards, permissions ---- */
+  #permissions-btn {
+    background: transparent;
+    color: var(--text);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 7px 10px;
+    font-size: 13px;
+    cursor: pointer;
+    margin-bottom: 12px;
+    text-align: left;
+  }
+  #permissions-btn:hover { border-color: #555; }
+  #permissions-btn .perm-state { float: right; color: var(--muted); font-size: 12px; }
+  .msg-row.tool .bubble {
+    background: transparent;
+    border: 1px dashed var(--border);
+    color: var(--muted);
+    font-size: 12.5px;
+    padding: 6px 10px;
+  }
+  .msg-row.tool details summary { cursor: pointer; user-select: none; }
+  .msg-row.tool details summary:hover { color: var(--text); }
+  .msg-row.tool .tool-output {
+    margin-top: 6px;
+    font-family: Consolas, Menlo, monospace;
+    font-size: 12px;
+    max-height: 320px;
+    overflow: auto;
+  }
+  .approval-card {
+    max-width: 70%;
+    border: 1px solid #d9a843;
+    background: #2f2a1a;
+    border-radius: 10px;
+    padding: 12px 14px;
+    font-size: 14px;
+  }
+  .approval-card .approval-title { font-weight: 600; margin-bottom: 8px; }
+  .approval-card pre {
+    margin: 0 0 6px;
+    padding: 8px 10px;
+    background: #1e1e1e;
+    border-radius: 6px;
+    white-space: pre-wrap;
+    word-break: break-all;
+    font-size: 12.5px;
+  }
+  .approval-card .approval-cwd { font-size: 12px; color: var(--muted); margin-bottom: 8px; }
+  .approval-card .approval-actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 10px; }
+  .approval-card button, #permissions-box button {
+    border: 1px solid var(--border);
+    background: #2f2f30;
+    color: var(--text);
+    border-radius: 6px;
+    padding: 6px 12px;
+    font-size: 13px;
+    cursor: pointer;
+  }
+  .approval-card button.primary, #permissions-box button.primary { background: var(--accent); border-color: var(--accent); color: white; }
+  .approval-card button:disabled { opacity: 0.5; cursor: not-allowed; }
+  .approval-card .approval-answer { margin-top: 8px; font-size: 12.5px; color: var(--muted); }
+
+  #permissions-overlay {
+    display: none;
+    position: fixed; inset: 0;
+    background: rgba(0,0,0,0.5);
+    align-items: center; justify-content: center;
+    z-index: 10;
+  }
+  #permissions-overlay.visible { display: flex; }
+  #permissions-box {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 20px;
+    width: min(560px, calc(100vw - 32px));
+    max-height: calc(100vh - 40px);
+    overflow-y: auto;
+    font-size: 14px;
+  }
+  #permissions-box h3 { margin: 0 0 4px; font-size: 16px; }
+  #permissions-box h4 { margin: 18px 0 6px; font-size: 13px; text-transform: uppercase; letter-spacing: 0.05em; color: var(--muted); }
+  #permissions-box .perm-help { color: var(--muted); font-size: 12.5px; margin: 4px 0 8px; }
+  #permissions-box select, #permissions-box input[type=text] {
+    background: #2f2f30;
+    color: var(--text);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 6px 8px;
+    font-size: 13px;
+  }
+  #permissions-box input[type=text] { flex: 1; min-width: 0; }
+  #permissions-box .perm-row { display: flex; gap: 8px; align-items: center; margin-bottom: 6px; }
+  #permissions-box .perm-item {
+    display: flex; gap: 8px; align-items: center;
+    padding: 5px 8px; margin-bottom: 4px;
+    background: #2a2a2b; border-radius: 6px; font-size: 13px;
+  }
+  #permissions-box .perm-item span { flex: 1; word-break: break-all; }
+  #permissions-box .perm-item button { padding: 2px 8px; font-size: 12px; }
+  #permissions-box .perm-empty { color: var(--muted); font-size: 12.5px; font-style: italic; }
+  #permissions-box .perm-master { display: flex; gap: 10px; align-items: flex-start; margin-top: 12px; cursor: pointer; }
+  #permissions-box .perm-master input { margin-top: 3px; }
+  #permissions-box .perm-sections.disabled { opacity: 0.45; pointer-events: none; }
+  #permissions-box .no-upload {
+    margin-top: 18px;
+    padding: 10px 12px;
+    border: 1px solid #3c6e4a;
+    background: #1d2b21;
+    border-radius: 8px;
+    font-size: 12.5px;
+    line-height: 1.5;
+  }
+  #permissions-error { color: #e57373; font-size: 12.5px; min-height: 1em; margin-top: 8px; }
+  #permissions-footer { display: flex; justify-content: space-between; margin-top: 16px; }
 </style>
 </head>
 <body>
@@ -475,6 +592,7 @@
   <div id="sidebar">
     <h2>Projects</h2>
     <button id="new-project-btn">+ New Project</button>
+    <button id="permissions-btn" title="What the assistant may do on this computer">🔐 Computer use <span class="perm-state" id="permissions-state">Off</span></button>
     <div id="project-list"></div>
     <div id="conversation-section">
       <h2>Conversations</h2>
@@ -531,6 +649,61 @@
     </div>
   </div>
 
+  <div id="permissions-overlay">
+    <div id="permissions-box">
+      <h3>Computer use</h3>
+      <div class="perm-help">Let the assistant build things on this computer, the way coding assistants do. You grant each permission here or on the request itself, and can revoke any of it at any time. Everything is off until you turn it on.</div>
+      <label class="perm-master"><input type="checkbox" id="perm-enabled"><span>Let the assistant use this computer — folders you share, commands and web downloads. Without this, it only works in each project's own files folder, as before.</span></label>
+
+      <div class="perm-sections" id="perm-sections">
+        <h4>Folders</h4>
+        <div class="perm-help">Shared folders it can use without asking. Anything else, it asks first. LLMlifeline's own folder (your conversations and settings) is always off limits.</div>
+        <div id="perm-folders"></div>
+        <div class="perm-row">
+          <input type="text" id="perm-folder-input" placeholder="Full folder path">
+          <select id="perm-folder-write"><option value="false">Read only</option><option value="true">Read &amp; write</option></select>
+          <button id="perm-folder-add">Add</button>
+        </div>
+
+        <h4>Commands</h4>
+        <div class="perm-row">
+          <select id="perm-commands">
+            <option value="off">Off — never run commands</option>
+            <option value="ask">Ask before each command</option>
+            <option value="auto">Run without asking</option>
+          </select>
+        </div>
+        <div class="perm-help">Commands that always run without asking (when set to Ask):</div>
+        <div id="perm-rules"></div>
+        <div class="perm-row">
+          <input type="text" id="perm-rule-input" placeholder="Command start, e.g. npm run">
+          <button id="perm-rule-add">Add</button>
+        </div>
+
+        <h4>Internet</h4>
+        <div class="perm-row">
+          <select id="perm-internet">
+            <option value="off">Off — no web access</option>
+            <option value="ask">Download only, asking before each new site</option>
+          </select>
+        </div>
+        <div class="perm-help">Sites it can download from without asking:</div>
+        <div id="perm-domains"></div>
+        <div class="perm-row">
+          <input type="text" id="perm-domain-input" placeholder="Site, e.g. docs.python.org">
+          <button id="perm-domain-add">Add</button>
+        </div>
+      </div>
+
+      <div class="no-upload"><strong>Never uploads your data.</strong> This isn't a setting and nothing above can turn it off. The assistant can only make plain downloads (no sending, no logins, no cookies). LLMlifeline refuses any web address that would carry text from your files, chats or command output. It also refuses commands that can send data off this computer, such as curl, scp, git push, publish and deploy tools, and scripts with network-sending code. Your model runs on this computer, so your conversations never leave it.</div>
+      <div id="permissions-error"></div>
+      <div id="permissions-footer">
+        <button id="perm-revoke-all">Revoke everything</button>
+        <button id="perm-done" class="primary">Done</button>
+      </div>
+    </div>
+  </div>
+
   <div id="lightbox-overlay">
     <button id="lightbox-close" title="Close (Esc)">&times;</button>
     <img id="lightbox-img" src="" alt="">
@@ -580,6 +753,18 @@ async function apiDelete(path) {
     throw new Error(`DELETE ${path} failed: ${res.status} — ${detail}`);
   }
   return res.json();
+}
+
+/** PUT that surfaces FastAPI's own error message ("detail") as-is, for the Permissions panel to show. */
+async function apiPut(path, body) {
+  const res = await fetch(`${API_BASE}${path}`, {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(data.detail || `PUT ${path} failed: ${res.status}`);
+  return data;
 }
 
 // ---------- Health check ----------
@@ -1015,8 +1200,12 @@ async function loadConversationIntoChat(projectId, conversationId) {
       clearChat();
     } else {
       messages.forEach((m) => {
-        addMessageBubble(m.role, m.content, m.reasoning, m.image_url, m.timestamp);
+        addMessageBubble(m.role, m.content, m.reasoning, m.image_url, m.timestamp, m.kind);
       });
+    }
+    if (conversation.pending_action) {
+      const p = conversation.pending_action;
+      addApprovalCard({ id: p.id, title: p.title, detail: p.detail, cwd: p.cwd, remember_label: p.remember_label });
     }
     el("delete-conversation-btn").disabled = false;
   } catch (e) {
@@ -1133,16 +1322,30 @@ function renderAssistantContent(container, content, reasoning) {
   }
 }
 
-function addMessageBubble(role, content, reasoning, imageUrl, timestamp) {
+function addMessageBubble(role, content, reasoning, imageUrl, timestamp, kind) {
   const emptyState = el("empty-state");
   if (emptyState) emptyState.remove();
 
   const row = document.createElement("div");
-  row.className = `msg-row ${role}`;
+  // A tool result is stored as a user-role message (that's what the model
+  // needs), but it's the computer talking, not the person — shown as a
+  // small collapsed note on the assistant's side instead.
+  row.className = kind === "tool_result" ? "msg-row tool" : `msg-row ${role}`;
   const bubble = document.createElement("div");
   bubble.className = "bubble";
 
-  if (imageUrl) {
+  if (kind === "tool_result") {
+    const details = document.createElement("details");
+    const summary = document.createElement("summary");
+    const firstLine = content.split("\n")[0];
+    summary.textContent = `🔧 ${firstLine.length > 110 ? firstLine.slice(0, 110) + "…" : firstLine}`;
+    const output = document.createElement("div");
+    output.className = "tool-output";
+    output.textContent = content.replace(/\n\n\[Continue the task\.[^\]]*\]$/, "");
+    details.appendChild(summary);
+    details.appendChild(output);
+    bubble.appendChild(details);
+  } else if (imageUrl) {
     const img = document.createElement("img");
     img.src = `${API_BASE}${imageUrl}`;
     img.alt = content;
@@ -1218,14 +1421,13 @@ async function sendMessage() {
         : `Generated an image for: "${text}"`;
       addMessageBubble("assistant", caption, null, data.image_url, data.timestamp);
     } else {
+      document.querySelectorAll(".approval-card button").forEach((b) => (b.disabled = true)); // a new message skips any open approval
       const data = await apiPost("/api/chat", {
         project_id: currentProjectId,
         conversation_id: currentConversationId,
         messages: [{ role: "user", content: text }],
       });
-      currentConversationId = data.conversation_id;
-      addMessageBubble("assistant", data.reply, data.reasoning, null, data.timestamp);
-      el("context-trimmed-notice").classList.toggle("visible", !!data.history_trimmed);
+      showAgentResponse(data);
     }
     await loadProjects(); // conversation count changed
     await loadConversations(currentProjectId, currentConversationId); // new/updated conversation in the picker
@@ -1238,6 +1440,195 @@ async function sendMessage() {
     typing.textContent = "Generating…"; // reset for next send
   }
 }
+
+// ---------- Computer use: steps and approvals ----------
+
+/** Renders one /api/chat or /api/chat/approve result: the tool steps it took, then its reply or an approval card. */
+function showAgentResponse(data) {
+  currentConversationId = data.conversation_id;
+  (data.steps || []).forEach((m) => addMessageBubble(m.role, m.content, m.reasoning, null, m.timestamp, m.kind));
+  if (data.reply !== null && data.reply !== undefined) {
+    addMessageBubble("assistant", data.reply, data.reasoning, null, data.timestamp);
+  }
+  if (data.pending_action) addApprovalCard(data.pending_action);
+  el("context-trimmed-notice").classList.toggle("visible", !!data.history_trimmed);
+}
+
+function addApprovalCard(pending) {
+  const row = document.createElement("div");
+  row.className = "msg-row assistant";
+  const card = document.createElement("div");
+  card.className = "approval-card";
+
+  const title = document.createElement("div");
+  title.className = "approval-title";
+  title.textContent = `🔐 ${pending.title}`;
+  const detail = document.createElement("pre");
+  detail.textContent = pending.detail;
+  card.append(title, detail);
+  if (pending.cwd) {
+    const cwd = document.createElement("div");
+    cwd.className = "approval-cwd";
+    cwd.textContent = `in ${pending.cwd}`;
+    card.appendChild(cwd);
+  }
+
+  const actions = document.createElement("div");
+  actions.className = "approval-actions";
+  const choices = [
+    ["once", "Allow once", "primary"],
+    ["always", pending.remember_label || "Always allow", ""],
+    ["deny", "Deny", ""],
+  ];
+  const answer = document.createElement("div");
+  answer.className = "approval-answer";
+  choices.forEach(([decision, label, cls]) => {
+    const b = document.createElement("button");
+    b.textContent = label;
+    if (cls) b.className = cls;
+    b.addEventListener("click", () => answerApproval(pending.id, decision, card, answer, label));
+    actions.appendChild(b);
+  });
+  card.append(actions, answer);
+  row.appendChild(card);
+  el("chat-scroll").appendChild(row);
+  el("chat-scroll").scrollTop = el("chat-scroll").scrollHeight;
+}
+
+async function answerApproval(actionId, decision, card, answer, label) {
+  card.querySelectorAll("button").forEach((b) => (b.disabled = true));
+  answer.textContent = `You chose: ${label}`;
+  const typing = el("typing-indicator");
+  typing.textContent = decision === "deny" ? "Continuing…" : "Working…";
+  typing.classList.add("visible");
+  el("send-btn").disabled = true;
+  try {
+    const data = await apiPost("/api/chat/approve", {
+      project_id: currentProjectId,
+      conversation_id: currentConversationId,
+      action_id: actionId,
+      decision,
+    });
+    showAgentResponse(data);
+    if (decision === "always") refreshPermissionsState();
+    await loadConversations(currentProjectId, currentConversationId);
+  } catch (e) {
+    addMessageBubble("assistant", `[Error] ${e.message}`);
+  } finally {
+    el("send-btn").disabled = false;
+    typing.classList.remove("visible");
+    typing.textContent = "Generating…";
+  }
+}
+
+// ---------- Computer use: permissions panel ----------
+// Every change saves straight away (PUT /api/permissions replaces the
+// whole set), so a grant or a revoke takes effect on the very next step
+// the assistant takes — there's no separate Save to forget.
+
+let permissions = null;
+
+async function refreshPermissionsState() {
+  try {
+    permissions = (await apiGet("/api/permissions")).permissions;
+    el("permissions-state").textContent = permissions.enabled ? "On" : "Off";
+  } catch {
+    el("permissions-state").textContent = "?";
+  }
+}
+
+async function savePermissions(next) {
+  el("permissions-error").textContent = "";
+  try {
+    permissions = (await apiPut("/api/permissions", next)).permissions;
+    renderPermissions();
+    return true;
+  } catch (e) {
+    el("permissions-error").textContent = e.message;
+    return false;
+  }
+}
+
+function permItem(text, onRemove) {
+  const item = document.createElement("div");
+  item.className = "perm-item";
+  const label = document.createElement("span");
+  label.textContent = text;
+  const remove = document.createElement("button");
+  remove.textContent = "Revoke";
+  remove.addEventListener("click", onRemove);
+  item.append(label, remove);
+  return item;
+}
+
+function renderPermList(containerId, items, emptyText) {
+  const container = el(containerId);
+  container.innerHTML = "";
+  if (items.length === 0) {
+    const empty = document.createElement("div");
+    empty.className = "perm-empty";
+    empty.textContent = emptyText;
+    container.appendChild(empty);
+  }
+  items.forEach((i) => container.appendChild(i));
+}
+
+function renderPermissions() {
+  const p = permissions;
+  el("perm-enabled").checked = p.enabled;
+  el("perm-sections").classList.toggle("disabled", !p.enabled);
+  el("perm-commands").value = p.commands;
+  el("perm-internet").value = p.internet;
+  el("permissions-state").textContent = p.enabled ? "On" : "Off";
+  renderPermList("perm-folders", p.folders.map((f) =>
+    permItem(`${f.path} — ${f.write ? "read & write" : "read only"}`,
+      () => savePermissions({ ...p, folders: p.folders.filter((x) => x.path !== f.path) }))),
+    "None shared yet.");
+  renderPermList("perm-rules", p.command_rules.map((r) =>
+    permItem(r, () => savePermissions({ ...p, command_rules: p.command_rules.filter((x) => x !== r) }))),
+    "None.");
+  renderPermList("perm-domains", p.domains.map((d) =>
+    permItem(d, () => savePermissions({ ...p, domains: p.domains.filter((x) => x !== d) }))),
+    "None.");
+}
+
+async function openPermissions() {
+  await refreshPermissionsState();
+  if (!permissions) return;
+  el("permissions-error").textContent = "";
+  renderPermissions();
+  el("permissions-overlay").classList.add("visible");
+}
+
+/** Wires an "Add" button and its text box (Enter works too) to append one value to a permissions list. */
+function wirePermAdd(buttonId, inputId, build) {
+  const add = async () => {
+    const value = el(inputId).value.trim();
+    if (!value) return;
+    if (await savePermissions(build(value))) el(inputId).value = "";
+  };
+  el(buttonId).addEventListener("click", add);
+  el(inputId).addEventListener("keydown", (e) => { if (e.key === "Enter") add(); });
+}
+
+el("permissions-btn").addEventListener("click", openPermissions);
+el("perm-done").addEventListener("click", () => el("permissions-overlay").classList.remove("visible"));
+el("permissions-overlay").addEventListener("click", (e) => {
+  if (e.target === el("permissions-overlay")) el("permissions-overlay").classList.remove("visible");
+});
+el("perm-enabled").addEventListener("change", (e) => savePermissions({ ...permissions, enabled: e.target.checked }));
+el("perm-commands").addEventListener("change", (e) => savePermissions({ ...permissions, commands: e.target.value }));
+el("perm-internet").addEventListener("change", (e) => savePermissions({ ...permissions, internet: e.target.value }));
+wirePermAdd("perm-folder-add", "perm-folder-input", (v) => ({
+  ...permissions, folders: [...permissions.folders, { path: v, write: el("perm-folder-write").value === "true" }],
+}));
+wirePermAdd("perm-rule-add", "perm-rule-input", (v) => ({ ...permissions, command_rules: [...permissions.command_rules, v] }));
+wirePermAdd("perm-domain-add", "perm-domain-input", (v) => ({ ...permissions, domains: [...permissions.domains, v] }));
+el("perm-revoke-all").addEventListener("click", () => {
+  if (confirm("Turn computer use off and remove every shared folder, command rule and site?")) {
+    savePermissions({ enabled: false, folders: [], commands: "ask", command_rules: [], internet: "ask", domains: [] });
+  }
+});
 
 // ---------- File uploads ----------
 // Separate from sendMessage's text-only flow: an upload has its own
@@ -1299,6 +1690,7 @@ el("lightbox-overlay").addEventListener("click", (e) => {
 });
 document.addEventListener("keydown", (e) => {
   if (e.key === "Escape" && el("lightbox-overlay").classList.contains("visible")) closeLightbox();
+  if (e.key === "Escape") el("permissions-overlay").classList.remove("visible");
 });
 
 el("send-btn").addEventListener("click", sendMessage);
@@ -1378,6 +1770,7 @@ el("modal-input").addEventListener("keydown", (e) => {
   await loadModels();
   await loadCheckpoints();
   await loadProjects();
+  refreshPermissionsState();
   applyModeToControls(); // activeMode starts "chat" — checkpoint-select disabled, chat controls enabled
   el("model-select").addEventListener("change", (e) => {
     if (e.target.value && e.target.value !== selectedModel) {

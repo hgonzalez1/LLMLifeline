@@ -32,6 +32,8 @@ import time
 import webbrowser
 from pathlib import Path
 
+APP_VERSION = "1.1.0"  # matches the GitHub release tag (v1.1.0)
+
 IS_WINDOWS = sys.platform == "win32"
 IS_MAC = sys.platform == "darwin"
 FROZEN = getattr(sys, "frozen", False)
@@ -468,10 +470,13 @@ def main():
     if "--self-test" in sys.argv:
         install_bundled_project()
         ok = BACKEND_MAIN.exists()
-        print(f"LLMlifeline launcher self-test: APP_ROOT={APP_ROOT} backend={'found' if ok else 'MISSING'}")
+        print(f"LLMlifeline {APP_VERSION} launcher self-test: APP_ROOT={APP_ROOT} "
+              f"backend={'found' if ok else 'MISSING'}")
         sys.exit(0 if ok else 1)
 
     _relaunch_in_terminal_if_needed()
+    print(f"LLMlifeline {APP_VERSION}")
+    print()
     install_bundled_project()
     os.chdir(APP_ROOT)
 

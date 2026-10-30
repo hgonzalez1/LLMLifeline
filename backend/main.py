@@ -38,13 +38,15 @@ import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path
+from urllib.parse import urlsplit
 
 import httpx
-from fastapi import BackgroundTasks, FastAPI, File, Form, HTTPException, UploadFile
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
+from fastapi import BackgroundTasks, FastAPI, File, Form, HTTPException, Request, UploadFile
+from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
+
+import computer_use
 
 # ---- Configuration ----
 
@@ -75,6 +77,13 @@ DEFAULT_MODEL = MODELS_DIR / "Qwen3-30B-A3B-Q4_K_M.gguf"
 LLAMA_SERVER_STARTUP_TIMEOUT = 600  # seconds — cold loads on this hardware have taken up to ~10 min
 
 PROJECTS_DIR.mkdir(parents=True, exist_ok=True)
+
+# Nothing this app starts should report usage anywhere — Hugging Face
+# downloads, ComfyUI, or tools the assistant runs. Child processes
+# inherit these. HF_HUB_DISABLE_IMPLICIT_TOKEN keeps a stored Hugging
+# Face login from being sent along with plain model downloads.
+for _name, _value in {**computer_use.NO_TELEMETRY_ENV, "HF_HUB_DISABLE_IMPLICIT_TOKEN": "1"}.items():
+    os.environ.setdefault(_name, _value)
 
 
 # ---- Image captioning (local, no external API) ----
@@ -373,6 +382,9 @@ class ImageServerManager:
             [
                 sys.executable, "main.py",
                 "--port", str(COMFYUI_PORT),
+                # ComfyUI's paid "API nodes" send prompts to comfy.org's
+                # servers; this also stops its frontend going online.
+                "--disable-api-nodes",
             ],
             cwd=str(COMFYUI_PATH),  # ComfyUI expects to run from its own directory
             stdout=self.log_file,
@@ -505,12 +517,29 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="LLMlifeline Backend", lifespan=lifespan)
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+_LOCAL_HOSTS = {"127.0.0.1", "localhost", "::1"}
+
+
+@app.middleware("http")
+async def _this_computer_only(request: Request, call_next):
+    """
+    This server holds your conversations and, with computer use on, can
+    run commands — so only this app's own page, on this computer, may
+    talk to it. (It used to allow any origin via CORS, which let any
+    website open in your browser read your conversations from
+    127.0.0.1:8001 and send them wherever it liked.)
+    - The Host header has to be this computer, which blocks DNS
+      rebinding: a website pointing its own name at 127.0.0.1.
+    - A request made by a web page has to come from this app's page
+      itself (same host and port).
+    """
+    host_header = request.headers.get("host", "")
+    if (urlsplit(f"//{host_header}").hostname or "") not in _LOCAL_HOSTS:
+        return JSONResponse({"detail": "LLMlifeline only answers requests from this computer."}, status_code=403)
+    origin = request.headers.get("origin")
+    if origin is not None and urlsplit(origin).netloc != host_header:
+        return JSONResponse({"detail": "LLMlifeline only answers its own page."}, status_code=403)
+    return await call_next(request)
 
 
 # ---- Data models ----
@@ -1633,7 +1662,10 @@ def _update_keyword_index_for_conversation(project_id: str, conversation: dict) 
                 "image_url": msg.get("image_url"),
                 "keywords": _extract_keywords(msg["image_caption"]),
             })
-        elif msg.get("role") == "user" and msg.get("content"):
+        elif msg.get("role") == "user" and msg.get("content") and not msg.get("kind"):
+            # (kind is set on tool results — stored as user-role messages,
+            # but they're file contents and command output, not something
+            # the person asked.)
             entries.append({
                 "kind": "message",
                 "content": msg["content"],
@@ -2160,70 +2192,131 @@ def _friendly_llama_error(e: httpx.HTTPStatusError) -> str:
     )
 
 
-@app.post("/api/chat")
-async def chat(request: ChatRequest, background_tasks: BackgroundTasks):
+MAX_AGENT_STEPS = 10  # model calls per message you send — a runaway task stops here, visibly
+
+# The project-files tool format the assistant has always been taught.
+# Computer use (see computer_use.tool_instructions) only ever adds to
+# this, so a 1B model that's learned this format keeps working.
+FILE_TOOL_INSTRUCTIONS = (
+    "You can create, read, or delete files in this project's files "
+    "folder. When the user asks you to do one of these, you must "
+    "respond with a block in this exact format — do not just describe "
+    "what you would do, actually output this block:\n\n"
+    "To CREATE or OVERWRITE a file:\n"
+    "```file-action\n"
+    "action: create\n"
+    "path: relative/path/to/file.ext\n"
+    "content: the full file content goes here\n"
+    "```\n"
+    "Example — user says \"create a file called notes.txt with the "
+    "text hello\":\n"
+    "```file-action\n"
+    "action: create\n"
+    "path: notes.txt\n"
+    "content: hello\n"
+    "```\n\n"
+    "To READ a file (you'll then be given its real content to answer with):\n"
+    "```file-action\n"
+    "action: read\n"
+    "path: relative/path/to/file.ext\n"
+    "```\n"
+    "Example — user says \"what does notes.txt say\":\n"
+    "```file-action\n"
+    "action: read\n"
+    "path: notes.txt\n"
+    "```\n\n"
+    "To DELETE a file — only when the user clearly and explicitly "
+    "asks you to delete or remove a specific file:\n"
+    "```file-action\n"
+    "action: delete\n"
+    "path: relative/path/to/file.ext\n"
+    "```\n"
+    "Example — user says \"delete notes.txt\":\n"
+    "```file-action\n"
+    "action: delete\n"
+    "path: notes.txt\n"
+    "```\n\n"
+    "For normal conversation with no file request, just reply "
+    "normally with no file-action block."
+)
+
+
+async def _ensure_model_running() -> None:
+    if llama_manager.is_alive():
+        return
+    # The subprocess died unexpectedly (OOM, crash, reload side-effect —
+    # see notes above start()). Rather than force the person back through
+    # the UI to manually re-swap, try relaunching the last-known model
+    # once before giving up. Uses the same lock as manual swaps so an
+    # automatic recovery can't race a user-triggered swap.
+    if llama_manager.current_model_path is None:
+        raise HTTPException(
+            status_code=503,
+            detail="No model is currently loaded. Swap to a model via /api/models/swap first.",
+        )
+    print(f"[backend] Model process found dead before chat request — "
+          f"attempting automatic relaunch of {llama_manager.current_model_path}")
+    async with llama_manager.lock:
+        if not llama_manager.is_alive():  # re-check inside the lock — another request may have already fixed this
+            llama_manager.start(llama_manager.current_model_path)
+            recovered = await _wait_for_server_ready()
+            if not recovered:
+                raise HTTPException(
+                    status_code=503,
+                    detail=f"Model process died and automatic relaunch of "
+                            f"{Path(llama_manager.current_model_path).name} failed. "
+                            f"Check {llama_manager.log_path} or try swapping models manually.",
+                )
+    print("[backend] Automatic relaunch succeeded, proceeding with chat request.")
+
+
+def _merge_consecutive_roles(messages: list[dict]) -> list[dict]:
     """
-    Proxy a chat request to the running llama_cpp.server, then save
-    both the user's message and the model's reply under the given project.
+    Gemma's chat template hard-rejects two user (or two assistant)
+    messages in a row (see the system-message note in
+    _build_model_history). Computer use can produce exactly that — a
+    tool result followed by a new message when the person skips an
+    approval card — so same-role neighbors are joined before anything
+    goes to the model.
     """
-    _require_project(request.project_id)
+    merged: list[dict] = []
+    for m in messages:
+        if merged and merged[-1]["role"] == m["role"]:
+            merged[-1] = {"role": m["role"], "content": merged[-1]["content"] + "\n\n" + m["content"]}
+        else:
+            merged.append(dict(m))
+    return merged
 
-    if not llama_manager.is_alive():
-        # The subprocess died unexpectedly (OOM, crash, reload side-effect —
-        # see notes above start()). Rather than force the person back through
-        # the UI to manually re-swap, try relaunching the last-known model
-        # once before giving up. Uses the same lock as manual swaps so an
-        # automatic recovery can't race a user-triggered swap.
-        if llama_manager.current_model_path is None:
-            raise HTTPException(
-                status_code=503,
-                detail="No model is currently loaded. Swap to a model via /api/models/swap first.",
-            )
-        print(f"[backend] Model process found dead before chat request — "
-              f"attempting automatic relaunch of {llama_manager.current_model_path}")
-        async with llama_manager.lock:
-            if not llama_manager.is_alive():  # re-check inside the lock — another request may have already fixed this
-                llama_manager.start(llama_manager.current_model_path)
-                recovered = await _wait_for_server_ready()
-                if not recovered:
-                    raise HTTPException(
-                        status_code=503,
-                        detail=f"Model process died and automatic relaunch of "
-                                f"{Path(llama_manager.current_model_path).name} failed. "
-                                f"Check {llama_manager.log_path} or try swapping models manually.",
-                    )
-        print("[backend] Automatic relaunch succeeded, proceeding with chat request.")
 
-    conversation_id = request.conversation_id or str(uuid.uuid4())
-    conversation = _load_conversation(request.project_id, conversation_id)
-    conversation["project_id"] = request.project_id
-    is_new_conversation = not conversation["messages"]
+def _latest_typed_message(conversation: dict) -> str | None:
+    """The person's own most recent message — not a tool result, which is
+    also stored as a user-role message."""
+    return next((m["content"] for m in reversed(conversation["messages"])
+                 if m["role"] == "user" and not m.get("kind")), None)
 
-    for msg in request.messages:
-        if msg.role == "user":
-            conversation["messages"].append({
-                "role": "user",
-                "content": msg.content,
-                "timestamp": datetime.now(timezone.utc).isoformat(),
-            })
 
+async def _build_model_history(project_id: str, conversation: dict, perms: dict
+                               ) -> tuple[list[dict], bool, int, list[str]]:
+    """
+    Everything the model sees for its next reply. Returns (history,
+    whether it was trimmed, the context length it was fit to, and the
+    persona/retrieved passages put in the system message — the no-upload
+    check treats those as the person's private text).
+    """
     # KNOWN ISSUE (not yet solved): Qwen3's <think> reasoning block adds
     # significant tokens/latency. See project notes — two suppression
     # approaches tried, both failed, reverted. Sending plain messages for now.
-    # This is also *why* the timeout below is generous: a creative request
-    # with an unsuppressed reasoning block, at ~5 tok/s, can genuinely need
-    # several minutes. Confirmed hitting the old 300s ceiling in testing.
     #
     # IMPORTANT: send the conversation's full saved history, not just the
     # newly-arrived message(s). Without this, every request was stateless —
     # the model had no memory of anything said earlier in this same
     # conversation, despite the UI showing an ongoing chat. Saved messages
-    # carry extra fields (timestamp, reasoning) the model API doesn't want;
-    # strip down to role/content only.
-    history_for_model = [
+    # carry extra fields (timestamp, reasoning, kind) the model API doesn't
+    # want; strip down to role/content only.
+    history_for_model = _merge_consecutive_roles([
         {"role": m["role"], "content": m["content"]}
         for m in conversation["messages"]
-    ]
+    ])
 
     # Combine all system-level guidance (tool instructions + any
     # cross-conversation context) into exactly ONE system message,
@@ -2234,58 +2327,16 @@ async def chat(request: ChatRequest, background_tasks: BackgroundTasks):
     # what the model's chat template actually tolerates; stacking system
     # messages, or inserting one on every turn of a growing multi-turn
     # conversation, breaks that structure.
-    tool_instructions = (
-        "You can create, read, or delete files in this project's files "
-        "folder. When the user asks you to do one of these, you must "
-        "respond with a block in this exact format — do not just describe "
-        "what you would do, actually output this block:\n\n"
-        "To CREATE or OVERWRITE a file:\n"
-        "```file-action\n"
-        "action: create\n"
-        "path: relative/path/to/file.ext\n"
-        "content: the full file content goes here\n"
-        "```\n"
-        "Example — user says \"create a file called notes.txt with the "
-        "text hello\":\n"
-        "```file-action\n"
-        "action: create\n"
-        "path: notes.txt\n"
-        "content: hello\n"
-        "```\n\n"
-        "To READ a file (you'll then be given its real content to answer with):\n"
-        "```file-action\n"
-        "action: read\n"
-        "path: relative/path/to/file.ext\n"
-        "```\n"
-        "Example — user says \"what does notes.txt say\":\n"
-        "```file-action\n"
-        "action: read\n"
-        "path: notes.txt\n"
-        "```\n\n"
-        "To DELETE a file — only when the user clearly and explicitly "
-        "asks you to delete or remove a specific file:\n"
-        "```file-action\n"
-        "action: delete\n"
-        "path: relative/path/to/file.ext\n"
-        "```\n"
-        "Example — user says \"delete notes.txt\":\n"
-        "```file-action\n"
-        "action: delete\n"
-        "path: notes.txt\n"
-        "```\n\n"
-        "For normal conversation with no file request, just reply "
-        "normally with no file-action block."
-    )
+    tool_instructions = computer_use.tool_instructions(perms, FILE_TOOL_INSTRUCTIONS)
 
     persona = _load_persona()
     system_message_parts = ([persona] if persona else []) + [tool_instructions]
+    private_context = [persona] if persona else []
 
-    latest_user_message = next(
-        (m.content for m in reversed(request.messages) if m.role == "user"), None
-    )
+    latest_user_message = _latest_typed_message(conversation)
     if latest_user_message:
         related = _find_relevant_context(
-            request.project_id, conversation_id, latest_user_message
+            project_id, conversation["id"], latest_user_message
         )
         if related:
             context_lines = []
@@ -2305,14 +2356,16 @@ async def chat(request: ChatRequest, background_tasks: BackgroundTasks):
                 "The following excerpts from other conversations in this project "
                 "may be relevant to the current question:\n\n" + "\n\n".join(context_lines)
             )
+            private_context += context_lines
 
-        document_passages = _find_project_document_passages(request.project_id, latest_user_message)
+        document_passages = _find_project_document_passages(project_id, latest_user_message)
         if document_passages:
             doc_lines = [f'[From an uploaded document "{p["source"]}"]: {p["content"]}' for p in document_passages]
             system_message_parts.append(
                 "The following passages from documents uploaded to this project "
                 "may be relevant to the current question:\n\n" + "\n\n".join(doc_lines)
             )
+            private_context += doc_lines
 
         belief_passages = _find_belief_passages(latest_user_message)
         if belief_passages:
@@ -2322,6 +2375,7 @@ async def chat(request: ChatRequest, background_tasks: BackgroundTasks):
                 "fit — cite the source file, don't just recite the passage flatly:\n\n"
                 + "\n\n".join(belief_passages)
             )
+            private_context += belief_passages
 
     combined_system_message = "\n\n---\n\n".join(system_message_parts)
 
@@ -2343,17 +2397,30 @@ async def chat(request: ChatRequest, background_tasks: BackgroundTasks):
     history_for_model, history_was_trimmed = await _fit_history_to_context(
         history_for_model, context_length
     )
+    return history_for_model, history_was_trimmed, context_length, private_context
 
-    # Generate the reply. llama_cpp.server defaults an unset max_tokens to
-    # "fill whatever's left of the context window" — which, combined with
-    # never checking finish_reason, is what let a cut-off answer through
-    # silently before this fix (a reply is only "done" when the model
-    # actually stopped on its own; hitting the token cap mid-sentence is
-    # a different, distinguishable outcome — OpenAI-style APIs report it
-    # via finish_reason == "length"). When that happens, ask the model to
-    # keep going from exactly where it stopped and stitch the pieces
-    # together, up to MAX_CONTINUATION_ROUNDS times, rather than ever
-    # showing a silently-truncated answer as if it were complete.
+
+async def _generate(history_for_model: list[dict], context_length: int
+                    ) -> tuple[str, str | None, bool, dict]:
+    """
+    One reply from the model: (content, reasoning, whether it was still
+    cut short, token usage).
+
+    llama_cpp.server defaults an unset max_tokens to "fill whatever's
+    left of the context window" — which, combined with never checking
+    finish_reason, is what let a cut-off answer through silently before
+    this fix (a reply is only "done" when the model actually stopped on
+    its own; hitting the token cap mid-sentence is a different,
+    distinguishable outcome — OpenAI-style APIs report it via
+    finish_reason == "length"). When that happens, ask the model to keep
+    going from exactly where it stopped and stitch the pieces together,
+    up to MAX_CONTINUATION_ROUNDS times, rather than ever showing a
+    silently-truncated answer as if it were complete.
+
+    The timeout is generous on purpose: a creative request with an
+    unsuppressed reasoning block, at ~5 tok/s, can genuinely need several
+    minutes. Confirmed hitting the old 300s ceiling in testing.
+    """
     current_messages = list(history_for_model)
     assistant_pieces: list[str] = []
     finish_reason = None
@@ -2446,156 +2513,189 @@ async def chat(request: ChatRequest, background_tasks: BackgroundTasks):
 
     # Strip a leading <think>...</think> block if present. This does NOT
     # reduce generation time or token cost — the model still generates the
-    # full reasoning internally either way (see KNOWN ISSUE note above,
-    # both suppression-at-generation attempts failed). This only cleans up
-    # what gets stored and returned, so raw <think> tags don't leak into
-    # saved conversations or the API response.
+    # full reasoning internally either way (see KNOWN ISSUE note in
+    # _build_model_history, both suppression-at-generation attempts
+    # failed). This only cleans up what gets stored and returned, so raw
+    # <think> tags don't leak into saved conversations or the API response.
     think_match = re.match(r"^<think>(.*?)</think>\s*(.*)$", raw_content, re.DOTALL)
     if think_match:
-        reasoning = think_match.group(1).strip()
-        assistant_content = think_match.group(2).strip()
-    else:
-        reasoning = None
-        assistant_content = raw_content
+        return think_match.group(2).strip(), think_match.group(1).strip(), response_cut_short, cumulative_usage
+    return raw_content, None, response_cut_short, cumulative_usage
 
-    # Detect and execute a file-action block, per the tool-use instructions
-    # taught in the system prompt above. Regex is deliberately tolerant of
-    # whitespace variation — a 1B model won't reproduce the exact format
-    # byte-for-byte every time — but a genuinely malformed or missing
-    # field fails visibly (a real error message replaces the block) rather
-    # than silently doing nothing, so the person can see something was
-    # attempted and why it didn't work.
-    # Detect and execute a file-action block, per the tool-use instructions
-    # taught in the system prompt above. Regex is deliberately tolerant of
-    # whitespace variation — a 1B model won't reproduce the exact format
-    # byte-for-byte every time — but a genuinely malformed or missing
-    # field fails visibly (a real error message replaces the block) rather
-    # than silently doing nothing, so the person can see something was
-    # attempted and why it didn't work.
-    #
-    # 'action' defaults to 'create' when absent, so every file-action
-    # block generated under the original (pre-extension) system prompt
-    # still parses and works exactly as before.
-    file_action_match = re.search(
-        r"```file-action\s*\n"
-        r"(?:action:\s*(\w+)\s*\n)?"
-        r"path:\s*(.+?)\s*\n"
-        r"(?:content:\s*(.*?)\n)?"
-        r"```",
-        assistant_content,
-        re.DOTALL,
-    )
-    if file_action_match:
-        action = (file_action_match.group(1) or "create").strip().lower()
-        action_path = file_action_match.group(2).strip()
-        action_content = file_action_match.group(3) or ""
 
-        if action == "create":
-            try:
-                resolved = _resolve_project_file(request.project_id, action_path)
-                resolved.parent.mkdir(parents=True, exist_ok=True)
-                resolved.write_text(action_content, encoding="utf-8")
-                confirmation = f"✅ Created file: `{action_path}`"
-            except HTTPException as e:
-                confirmation = f"⚠️ Could not create file `{action_path}`: {e.detail}"
-            assistant_content = (
-                assistant_content[:file_action_match.start()]
-                + confirmation
-                + assistant_content[file_action_match.end():]
-            ).strip()
+def _now() -> str:
+    return datetime.now(timezone.utc).isoformat()
 
-        elif action == "delete":
-            # One-way and destructive — report honestly rather than
-            # pretending success if the file was never real to begin with.
-            try:
-                resolved = _resolve_project_file(request.project_id, action_path)
-                if not resolved.exists():
-                    confirmation = f"⚠️ Could not delete `{action_path}`: file not found."
-                elif not resolved.is_file():
-                    confirmation = f"⚠️ Could not delete `{action_path}`: it's a directory, not a file."
-                else:
-                    resolved.unlink()
-                    confirmation = f"🗑️ Deleted file: `{action_path}`"
-            except HTTPException as e:
-                confirmation = f"⚠️ Could not delete `{action_path}`: {e.detail}"
-            assistant_content = (
-                assistant_content[:file_action_match.start()]
-                + confirmation
-                + assistant_content[file_action_match.end():]
-            ).strip()
 
-        elif action == "read":
-            # Two-step: fetch the real content, then make a SECOND model
-            # call with that content included, so the final reply is
-            # grounded in what's actually in the file rather than the
-            # model guessing/hallucinating contents it never saw.
-            try:
-                resolved = _resolve_project_file(request.project_id, action_path)
-                if not resolved.exists():
-                    file_content_for_model = f"[File not found: {action_path}]"
-                elif not resolved.is_file():
-                    file_content_for_model = f"[{action_path} is a directory, not a file]"
-                else:
-                    file_content_for_model = resolved.read_text(encoding="utf-8")
-            except (HTTPException, UnicodeDecodeError) as e:
-                file_content_for_model = f"[Could not read {action_path}: {e}]"
+def _user_texts(conversation: dict, private_context: list[str], batch_results: list[dict]
+                ) -> tuple[list[str], list[str]]:
+    """
+    What the no-upload check treats as the person's own text: (private —
+    files read, command output, persona, retrieved passages; chat — what
+    they typed). Downloaded web pages are in neither: following a link
+    from a page isn't leaking anyone's data.
+    """
+    private = list(private_context)
+    private += [m["content"] for m in conversation["messages"]
+                if m.get("kind") == "tool_result" and not m.get("public_only")]
+    private += [r["text"] for r in batch_results if not r["public"]]
+    chat = [m["content"] for m in conversation["messages"] if m["role"] == "user" and not m.get("kind")]
+    return private, chat
 
-            follow_up_messages = history_for_model + [
-                {"role": "assistant", "content": assistant_content},
-                {
-                    "role": "user",
-                    "content": f"[System: contents of {action_path}]\n\n{file_content_for_model}\n\n"
-                                f"Now answer the original question using this file content.",
-                },
-            ]
-            # The file's real content can itself be large enough to blow
-            # the same context budget the original request was just fit
-            # to — re-trim rather than assume history_for_model already
-            # being in-budget still holds once a whole file is appended.
-            follow_up_messages, _ = await _fit_history_to_context(
-                follow_up_messages, context_length
-            )
-            follow_up_payload = {"messages": follow_up_messages, "max_tokens": RESPONSE_TOKEN_RESERVE}
-            try:
-                async with httpx.AsyncClient(timeout=900.0) as follow_up_client:
-                    follow_up_response = await follow_up_client.post(
-                        f"{LLAMA_SERVER_URL}/v1/chat/completions", json=follow_up_payload
-                    )
-                    follow_up_response.raise_for_status()
-                follow_up_choice = follow_up_response.json()["choices"][0]
-                assistant_content = follow_up_choice["message"]["content"].strip()
-                if follow_up_choice.get("finish_reason") == "length":
-                    # Same truncation guarantee as the main reply — this
-                    # secondary call doesn't get the multi-round
-                    # continuation loop (it's already a follow-up), so
-                    # just say plainly that it was cut short.
-                    response_cut_short = True
-                    assistant_content += (
-                        "\n\n*[This reply was cut short — reading the file back left "
-                        "too little room in the model's context for a full answer. "
-                        "Try a shorter file, a new conversation, or turn on "
-                        "\"2x Context\" and restart the model.]*"
-                    )
-            except httpx.HTTPStatusError as e:
-                assistant_content = (
-                    f"{assistant_content}\n\n[Could not read {action_path} back to you: "
-                    f"{_friendly_llama_error(e)}]"
-                )
-            except (httpx.ConnectError, httpx.ReadTimeout):
-                assistant_content = (
-                    f"{assistant_content}\n\n[Could not reach the model to read "
-                    f"{action_path} back to you — it may still be busy or have "
-                    f"crashed. Check llama_server.log.]"
-                )
 
-    assistant_timestamp = datetime.now(timezone.utc).isoformat()
-    conversation["messages"].append({
-        "role": "assistant",
-        "content": assistant_content,
-        "reasoning": reasoning,
-        "timestamp": assistant_timestamp,
-    })
+def _pending_for_ui(pending: dict | None) -> dict | None:
+    if not pending:
+        return None
+    return {key: pending.get(key) for key in ("id", "title", "detail", "cwd", "remember_label")} | {
+        "type": pending["action"]["type"]}
+
+
+def _agent_response(conversation: dict, start_index: int, final: dict | None, usage: dict,
+                    history_trimmed: bool, response_cut_short: bool, pending: dict | None) -> dict:
+    added = conversation["messages"][start_index:]
+    return {
+        "conversation_id": conversation["id"],
+        "project_id": conversation["project_id"],
+        "reply": final["content"] if final else None,
+        "reasoning": final.get("reasoning") if final else None,
+        "timestamp": final["timestamp"] if final else None,
+        "usage": usage,
+        "history_trimmed": history_trimmed,
+        "response_cut_short": response_cut_short,
+        # Tool calls and results from this turn, for the UI to show.
+        "steps": added[:-1] if final else added,
+        "pending_action": _pending_for_ui(pending),
+    }
+
+
+async def _run_agent(project_id: str, conversation: dict, start_index: int,
+                     steps_used: int = 0, carry: dict | None = None) -> dict:
+    """
+    Model → action blocks → results → model, until it answers with no
+    action, an action needs the person's approval (saved as the
+    conversation's pending_action — /api/chat/approve picks it up from
+    there), or MAX_AGENT_STEPS runs out. `carry` resumes a half-finished
+    batch of actions after an approval.
+
+    With computer use off, a reply that only creates/deletes project
+    files is confirmed inline with no extra model call — exactly how the
+    single file-action block always worked. Reading a file feeds the
+    content back for a grounded answer, as before.
+    """
+    perms = computer_use.load_permissions()
+    workspace = _project_files_dir(project_id)
+    workspace.mkdir(parents=True, exist_ok=True)
+    usage: dict = {}
+    history_trimmed = False
+    response_cut_short = False
+    private_context: list[str] = carry.get("private_context", []) if carry else []
+    final: dict | None = None
+
+    while True:
+        if carry is None:
+            if steps_used >= MAX_AGENT_STEPS:
+                final = {"role": "assistant", "timestamp": _now(), "reasoning": None, "content": (
+                    f"I stopped after {MAX_AGENT_STEPS} steps without finishing. "
+                    f"Tell me to keep going if you'd like me to continue.")}
+                break
+            history, trimmed, context_length, private_context = await _build_model_history(
+                project_id, conversation, perms)
+            history_trimmed = history_trimmed or trimmed
+            content, reasoning, response_cut_short, step_usage = await _generate(history, context_length)
+            steps_used += 1
+            for k, v in step_usage.items():
+                usage[k] = usage.get(k, 0) + v
+
+            actions = computer_use.parse_actions(content)
+            if not actions:
+                final = {"role": "assistant", "content": content, "reasoning": reasoning, "timestamp": _now()}
+                break
+            if not perms["enabled"] and all(a["type"] == "file" and a["action"] in ("create", "delete")
+                                            for a in actions):
+                for a in reversed(actions):
+                    private, chat = _user_texts(conversation, private_context, [])
+                    decision = computer_use.decide(perms, a, workspace, private, chat)
+                    note = (computer_use.run_file_action(a, workspace) if decision["status"] == "allow"
+                            else f"⚠️ Could not {a['action']} `{a['path']}`: {decision['reason']}")
+                    content = content[:a["span"][0]] + note + content[a["span"][1]:]
+                final = {"role": "assistant", "content": content.strip(), "reasoning": reasoning,
+                         "timestamp": _now()}
+                break
+            conversation["messages"].append({"role": "assistant", "kind": "tool_call", "content": content,
+                                             "reasoning": reasoning, "timestamp": _now()})
+            queue, results = actions, []
+        else:
+            queue, results = carry["queue"], carry["results"]
+            carry = None
+
+        while queue:
+            action = queue[0]
+            private, chat = _user_texts(conversation, private_context, results)
+            decision = computer_use.decide(perms, action, workspace, private, chat)
+            if decision["status"] == "ask":
+                pending = {**decision, "id": action["id"], "action": action, "queue": queue,
+                           "results": results, "steps_used": steps_used, "private_context": private_context}
+                conversation["pending_action"] = pending
+                _save_conversation(conversation)
+                return _agent_response(conversation, start_index, None, usage, history_trimmed,
+                                       response_cut_short, pending)
+            if decision["status"] == "deny":
+                results.append({"text": f"⛔ Not done ({computer_use.describe(action)}): {decision['reason']}",
+                                "public": True})
+            else:
+                text = await computer_use.execute(action, decision, perms, workspace, private, chat)
+                results.append({"text": text, "public": action["type"] == "fetch" and not action.get("save")})
+            queue = queue[1:]
+
+        conversation["messages"].append({
+            "role": "user", "kind": "tool_result", "timestamp": _now(),
+            "public_only": all(r["public"] for r in results),
+            "content": "\n\n".join(r["text"] for r in results)
+                       + "\n\n[Continue the task. When it's done, reply to the person normally, with no action block.]",
+        })
+        _save_conversation(conversation)  # progress survives a crash partway through a long task
+
+    conversation["messages"].append(final)
+    conversation.pop("pending_action", None)
     _save_conversation(conversation)
+    return _agent_response(conversation, start_index, final, usage, history_trimmed,
+                           response_cut_short, None)
+
+
+@app.post("/api/chat")
+async def chat(request: ChatRequest, background_tasks: BackgroundTasks):
+    """
+    Send the person's message to the running llama_cpp.server and save
+    both it and the reply under the given project. With computer use on,
+    the reply can take several steps (see _run_agent), and may stop
+    partway with a pending_action for the person to approve.
+    """
+    _require_project(request.project_id)
+    await _ensure_model_running()
+
+    conversation_id = request.conversation_id or str(uuid.uuid4())
+    conversation = _load_conversation(request.project_id, conversation_id)
+    conversation["project_id"] = request.project_id
+    is_new_conversation = not conversation["messages"]
+
+    pending = conversation.pop("pending_action", None)
+    if pending:
+        # The person moved on without answering the approval card.
+        skipped = [r["text"] for r in pending["results"]] + [
+            f"⏭️ Not done ({computer_use.describe(pending['action'])}): the person sent a new "
+            f"message instead of approving it."]
+        conversation["messages"].append({"role": "user", "kind": "tool_result", "public_only": False,
+                                         "content": "\n\n".join(skipped), "timestamp": _now()})
+
+    for msg in request.messages:
+        if msg.role == "user":
+            conversation["messages"].append({
+                "role": "user",
+                "content": msg.content,
+                "timestamp": _now(),
+            })
+
+    result = await _run_agent(request.project_id, conversation, len(conversation["messages"]))
 
     if is_new_conversation:
         first_user_message = next((m.content for m in request.messages if m.role == "user"), None)
@@ -2603,17 +2703,87 @@ async def chat(request: ChatRequest, background_tasks: BackgroundTasks):
             background_tasks.add_task(
                 _title_background_task, request.project_id, conversation_id, first_user_message
             )
+    return result
 
-    return {
-        "conversation_id": conversation_id,
-        "project_id": request.project_id,
-        "reply": assistant_content,
-        "reasoning": reasoning,
-        "timestamp": assistant_timestamp,
-        "usage": cumulative_usage,
-        "history_trimmed": history_was_trimmed,
-        "response_cut_short": response_cut_short,
-    }
+
+class ApprovalRequest(BaseModel):
+    project_id: str
+    conversation_id: str
+    action_id: str
+    decision: str  # "once" | "always" | "deny"
+
+
+@app.post("/api/chat/approve")
+async def approve_action(request: ApprovalRequest):
+    """The person's answer to an approval card: carry out (or skip) the
+    waiting action, then let the assistant continue."""
+    _require_project(request.project_id)
+    if request.decision not in ("once", "always", "deny"):
+        raise HTTPException(status_code=400, detail="decision must be once, always or deny.")
+    conversation = _load_conversation(request.project_id, request.conversation_id)
+    pending = conversation.get("pending_action")
+    if not pending or pending["id"] != request.action_id:
+        raise HTTPException(status_code=409, detail="That request isn't waiting for approval anymore.")
+    await _ensure_model_running()
+    conversation.pop("pending_action")
+    conversation["project_id"] = request.project_id
+
+    perms = computer_use.load_permissions()
+    workspace = _project_files_dir(request.project_id)
+    action, results = pending["action"], pending["results"]
+    if request.decision == "deny":
+        results.append({"public": True, "text": (
+            f"🚫 The person declined: {computer_use.describe(action)}. Don't try it again — carry on "
+            f"without it, or ask them what they'd like instead.")})
+    else:
+        if request.decision == "always":
+            perms = computer_use.remember(perms, pending["remember"])
+        private, chat = _user_texts(conversation, pending["private_context"], results)
+        # Re-checked now, not trusted from when the card was made: a
+        # permission revoked in the meantime, or the hard no-upload rules,
+        # still win over the click.
+        decision = computer_use.decide(perms, action, workspace, private, chat)
+        if decision["status"] == "deny":
+            results.append({"public": True,
+                            "text": f"⛔ Not done ({computer_use.describe(action)}): {decision['reason']}"})
+        else:  # "allow", or "ask" — which is the question the person just answered
+            text = await computer_use.execute(action, decision, perms, workspace, private, chat)
+            results.append({"text": text, "public": action["type"] == "fetch" and not action.get("save")})
+
+    carry = {"queue": pending["queue"][1:], "results": results, "private_context": pending["private_context"]}
+    return await _run_agent(request.project_id, conversation, len(conversation["messages"]),
+                            pending["steps_used"], carry)
+
+
+# ---- Computer-use permissions ----
+
+@app.get("/api/permissions")
+def get_permissions():
+    return {"permissions": computer_use.load_permissions(), "example_folder": computer_use.EXAMPLE_FOLDER}
+
+
+@app.put("/api/permissions")
+def put_permissions(body: dict):
+    """Replaces the whole permissions set — the Permissions panel sends it
+    after every change, grants and revokes alike."""
+    current = computer_use.load_permissions()
+    try:
+        perms = computer_use.validate_permissions(body, strict=True)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    known = {f["path"] for f in current["folders"]}
+    for folder in perms["folders"]:
+        path = Path(folder["path"])
+        if folder["path"] in known:
+            continue
+        # A folder that merely contains LLMlifeline's (say, the whole
+        # drive) is fine — check_path still keeps LLMlifeline's own
+        # folder off limits inside it.
+        if path.is_relative_to(APP_ROOT):
+            raise HTTPException(status_code=400, detail="LLMlifeline's own folder can't be shared with the assistant.")
+        if not path.is_dir():
+            raise HTTPException(status_code=400, detail=f"'{path}' doesn't exist or isn't a folder.")
+    return {"permissions": computer_use.save_permissions(perms)}
 
 
 # ---- Health check ----

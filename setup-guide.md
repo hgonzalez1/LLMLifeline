@@ -128,6 +128,16 @@ If you're building the zip yourself and want it smaller/faster to transfer, you 
 
 **Starting up:** run `start.bat` (or `LLMlifeline.exe`). That's the only step for a normal session — see **[README.md](README.md)** for everything the app itself can do: projects, chatting, image generation, uploads, and customizing the persona/beliefs/models.
 
+**Updating to a new version:** none of these steps touch your conversations, persona, beliefs, models or permissions.
+- **Mac:** install the new `.dmg` over the old app. Code in `~/LLMlifeline` is refreshed on its next launch.
+- **Windows:** stop LLMlifeline, then copy the contents of the `-update.zip`'s `LLMlifeline` folder over yours, choosing Replace.
+- **Linux:** stop LLMlifeline, then unpack the `-update.tar.gz` next to your `LLMlifeline` folder.
+- **From git:** `git pull`.
+
+The update packages leave out `persona.txt` and `beliefs/` on purpose. Each release's notes on the [Releases page](https://github.com/hgonzalez1/LLMLifeline/releases) say what changed.
+
+**Computer use settings** live in `permissions.json` in the project folder. Normally you edit them from the app's Permissions panel. Deleting the file turns everything off again. `tests/test_computer_use.py` checks the no-upload rules, with no model needed: `llm-env\Scripts\python.exe tests\test_computer_use.py`.
+
 ---
 
 ## Understanding what's happening under the hood (optional)

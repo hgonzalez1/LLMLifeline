@@ -79,6 +79,13 @@ jobs:
         with:
           python-version: "3.12"
       - run: python -m pip install pyinstaller
+
+      # Computer use and its no-upload rules, with a scripted model.
+      - name: Tests
+        run: |
+          python -m pip install fastapi uvicorn httpx python-multipart
+          python tests/test_computer_use.py
+
       - run: python -m PyInstaller --onefile --console --name LLMlifeline launcher.py
 
       # Same shape as the Windows download: the project folder with the
@@ -87,15 +94,20 @@ jobs:
         run: |
           mkdir stage
           git archive --prefix=LLMlifeline/ HEAD | tar -x -C stage
-          rm -rf stage/LLMlifeline/.github stage/LLMlifeline/packaging stage/LLMlifeline/*.bat
+          rm -rf stage/LLMlifeline/.github stage/LLMlifeline/packaging stage/LLMlifeline/tests stage/LLMlifeline/*.bat
           cp dist/LLMlifeline stage/LLMlifeline/
           stage/LLMlifeline/LLMlifeline --self-test
           tar -czf LLMlifeline-linux-x86_64.tar.gz -C stage LLMlifeline
+          # The update package is the same minus the files that are yours
+          # to edit, so unpacking it over an existing install never
+          # replaces your persona or beliefs.
+          rm -rf stage/LLMlifeline/persona.txt stage/LLMlifeline/beliefs
+          tar -czf LLMlifeline-linux-x86_64-update.tar.gz -C stage LLMlifeline
 
       - uses: actions/upload-artifact@v4
         with:
           name: linux
-          path: LLMlifeline-linux-x86_64.tar.gz
+          path: LLMlifeline-linux-x86_64*.tar.gz
 
   windows:
     runs-on: windows-latest
@@ -114,15 +126,19 @@ jobs:
         run: |
           mkdir -p stage/LLMlifeline
           git ls-files -z | tar --null -T - -cf - | tar -xf - -C stage/LLMlifeline
-          rm -rf stage/LLMlifeline/.github stage/LLMlifeline/packaging
+          rm -rf stage/LLMlifeline/.github stage/LLMlifeline/packaging stage/LLMlifeline/tests
           cp dist/LLMlifeline.exe stage/LLMlifeline/
           stage/LLMlifeline/LLMlifeline.exe --self-test
           cd stage && 7z a -tzip ../LLMlifeline-windows-x64.zip LLMlifeline
+          # Update package: everything but your persona and beliefs (see
+          # the Linux job).
+          rm -rf LLMlifeline/persona.txt LLMlifeline/beliefs
+          7z a -tzip ../LLMlifeline-windows-x64-update.zip LLMlifeline
 
       - uses: actions/upload-artifact@v4
         with:
           name: windows
-          path: LLMlifeline-windows-x64.zip
+          path: LLMlifeline-windows-x64*.zip
 
   release:
     # Publishes whatever built, as long as the Mac build did — one broken

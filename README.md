@@ -30,7 +30,26 @@ Check the **Image Model** box at the top to switch modes — this automatically 
 
 ### Asking the assistant to work with files
 
-Just ask naturally — "create a file called notes.txt with this content," "what does that file say," "delete the old draft." Each project has its own private `files/` workspace, and the assistant genuinely creates, reads, and deletes real files there on request — not simulated, not just describing what it would do. It's confined to that one project's workspace and can't touch anything else on your computer.
+Just ask naturally — "create a file called notes.txt with this content," "what does that file say," "delete the old draft." Each project has its own private `files/` workspace, and the assistant genuinely creates, reads, and deletes real files there on request — not simulated, not just describing what it would do. Unless you turn on computer use (below), it's confined to that one project's workspace and can't touch anything else on your computer.
+
+### Computer use — letting the assistant build things on your computer
+
+Click **🔐 Computer use** in the sidebar and tick the box. The assistant can then work like a coding assistant: read and write folders you share, run commands (build, test, install packages), and download web pages and files. It works in steps, shown in the chat as small 🔧 notes you can expand.
+
+**You're in charge of every permission:**
+- Anything it hasn't been given yet shows an approval card first, with exactly what it wants to do: the command, the web address or the file. Choose **Allow once**, **Always allow** (for that command, site or folder) or **Deny**.
+- The Permissions panel lists everything you've granted. **Revoke** removes any one item, and **Revoke everything** turns it all off.
+- Commands can be off, ask before each one, or run without asking. Web access is download-only and asks before each new site.
+
+**It never uploads your data.** That isn't a setting, and nothing in the panel can turn it off:
+- The assistant can only make plain downloads (no sending, no logins, no cookies).
+- Any web address that would carry text from your files, chats or command output is refused.
+- Commands that can send data off your computer are refused: curl, scp, git push, publish and deploy tools, and scripts with network-sending code.
+- LLMlifeline's own folder (your conversations and settings) is always off limits.
+
+What it can't promise: a program can do anything once it runs. LLMlifeline checks each command and any script it can read, but it can't see inside a compiled program. That's why commands ask first by default.
+
+Small models follow the step format less reliably. A bigger chat model will build things far better.
 
 ### Uploading images and documents
 

@@ -30,6 +30,10 @@ models/.default_models_downloaded
 projects/
 generated_images/
 
+# Your computer-use grants (shared folders, allowed commands and sites)
+# — this machine's settings, edited from the app's Permissions panel.
+permissions.json
+
 # persona.txt and beliefs/ ARE shipped as real defaults, by request —
 # everything in beliefs/ EXCEPT the NASB translation specifically,
 # which is copyrighted by the Lockman Foundation and not ours to

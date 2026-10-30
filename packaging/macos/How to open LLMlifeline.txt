@@ -38,3 +38,7 @@ LLMlifeline for Mac (Apple Silicon: M1 or newer)
 Your conversations, persona.txt, beliefs and models all live in
 ~/LLMlifeline. Nothing is uploaded anywhere. Deleting the app leaves
 that folder in place.
+
+Updating from an older version: drag the new LLMlifeline into
+Applications, choose Replace, and run the xattr command from step 3
+again. Everything in ~/LLMlifeline is kept.
