@@ -307,8 +307,10 @@ NETWORK_CODE_PATTERNS = [
     r"\b(require|import)\s*\(\s*['\"](node:)?(https?|net|tls|dgram|node-fetch|axios|got|request|"
     r"undici|ws|nodemailer|ftp|ssh2)['\"]",
     r"\bfrom\s+['\"](node:)?(https?|net|tls|dgram|node-fetch|axios|got|undici|ws|nodemailer|ssh2)['\"]",
-    r"(?i)\b(Invoke-WebRequest|Invoke-RestMethod|Start-BitsTransfer|Send-MailMessage)\b",
-    r"(?i)\bNet\.WebClient\b", r"(?i)\bSystem\.Net\.(Http|Sockets|WebClient|Mail)\b", r"(?i)\bTcpClient\b",
+    # Scoped (?i:...) flags, not a leading (?i): these get joined into one
+    # regex below, and Python 3.11+ refuses a global flag mid-pattern.
+    r"(?i:\b(Invoke-WebRequest|Invoke-RestMethod|Start-BitsTransfer|Send-MailMessage)\b)",
+    r"(?i:\bNet\.WebClient\b)", r"(?i:\bSystem\.Net\.(Http|Sockets|WebClient|Mail)\b)", r"(?i:\bTcpClient\b)",
     r"\bNet::(HTTP|FTP|SMTP)\b", r"\bLWP::", r"\bIO::Socket\b", r"\bcurl_exec\b", r"\bfsockopen\b",
     r"\"net/http\"", r"\"net\"", r"\bjava\.net\.", r"\breqwest::",
 ]

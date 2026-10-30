@@ -1,6 +1,8 @@
 A private AI chat and image generator that runs on your own computer. No cloud, no subscription, no account.
 
-## New in 1.1.0: computer use
+**1.1.1** fixes a startup crash in 1.1.0. Its backend wouldn't start when LLMlifeline's Python environment was Python 3.11 or newer, which covers most Macs. If you installed 1.1.0, update to this one the same way as described below.
+
+## New in 1.1: computer use
 
 The assistant can now work on your computer to build things, the way coding assistants do. It can read and write folders you share, run commands, and download web pages. It's **off until you turn it on** under **🔐 Computer use** in the sidebar.
 
@@ -20,7 +22,7 @@ What it can't promise: a program can do anything once it runs. LLMlifeline check
 
 **Also fixed:** any website open in your browser could previously read LLMlifeline's local server, including your conversations. LLMlifeline now answers only its own page on your computer. ComfyUI's online "API nodes" are switched off.
 
-## Updating from 1.0.0
+## Updating from 1.0.0 or 1.1.0
 
 Your conversations, persona, beliefs and models are never touched by these updates.
 
