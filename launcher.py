@@ -32,7 +32,7 @@ import time
 import webbrowser
 from pathlib import Path
 
-APP_VERSION = "1.1.1"  # matches the GitHub release tag (v1.1.1)
+APP_VERSION = "1.2.0"  # matches the GitHub release tag (v1.2.0)
 
 IS_WINDOWS = sys.platform == "win32"
 IS_MAC = sys.platform == "darwin"
@@ -65,6 +65,11 @@ else:
 BACKEND_DIR = APP_ROOT / "backend"
 BACKEND_MAIN = BACKEND_DIR / "main.py"
 REQUIREMENTS = BACKEND_DIR / "requirements.txt"
+CLIENT_REQUIREMENTS = BACKEND_DIR / "requirements-client.txt"
+# Present when this computer uses a model shared by another computer on
+# the network (server mode) instead of running its own — see
+# choose_install_kind. The backend reads it too.
+LIGHTWEIGHT_MARKER = APP_ROOT / "lightweight-install.txt"
 BACKEND_HOST = "127.0.0.1"
 BACKEND_PORT = 8001
 
@@ -307,6 +312,8 @@ def ensure_dependencies():
         "sse_starlette": "llama-cpp-python server extras (needed to run chat models)",
         "pypdf": "pypdf",
         "comfy_kitchen": "comfy_kitchen",
+        "cryptography": "cryptography (needed for Network server mode)",
+        "zeroconf": "zeroconf (finds other LLMlifeline computers on your network)",
     }
     missing = [label for mod, label in module_to_label.items() if not _check_importable(mod)]
     if not _check_importable("transformers") or not _check_importable("PIL"):
@@ -389,6 +396,60 @@ def ensure_comfyui_dependencies():
     if result.returncode != 0:
         print("\nWARNING: ComfyUI's packages did not install. Chat will still work;")
         print("Image Model will not until this is resolved. See output above.")
+    print()
+
+
+def choose_install_kind() -> bool:
+    """
+    True for a lightweight install. Asked once, on a brand-new setup only:
+    a computer without a capable GPU can use the model another computer
+    on the network shares (Network → Share this computer's model there),
+    and then needs none of torch, ComfyUI, llama-cpp-python or the ~49GB
+    of models. An existing install is never asked — it's a full one.
+    Delete lightweight-install.txt to turn a lightweight install into a
+    full one on the next start.
+    """
+    if LIGHTWEIGHT_MARKER.exists():
+        return True
+    models_dir = APP_ROOT / "models"
+    has_models = models_dir.exists() and any(models_dir.glob("*.gguf"))
+    if (APP_ROOT / "llm-env").exists() or (APP_ROOT / "ComfyUI").exists() or has_models:
+        return False
+    print("Where will this computer's AI model run?")
+    print("  1) Here, on this computer - the full install. Best with a strong")
+    print("     graphics card. Downloads about 60 GB (models and image tools).")
+    print("  2) On another computer on my network - a lightweight install (under")
+    print("     1 GB). That computer shares its model from LLMlifeline's Network")
+    print("     panel; this one keeps its own chats and projects.")
+    try:
+        answer = input("Choose 1 or 2 [1]: ").strip()
+    except EOFError:
+        answer = ""
+    print()
+    if answer != "2":
+        return False
+    LIGHTWEIGHT_MARKER.write_text(
+        "This LLMlifeline uses a model shared by another computer on your network\n"
+        "(connect to it in the app's Network panel), so it skips installing models,\n"
+        "ComfyUI and the GPU libraries. Delete this file to switch to a full install\n"
+        "the next time LLMlifeline starts.\n", encoding="utf-8")
+    return True
+
+
+def ensure_client_dependencies():
+    """The lightweight install's much smaller package list."""
+    print("Checking dependencies...")
+    modules = ("fastapi", "uvicorn", "httpx", "multipart", "pypdf", "zeroconf")
+    if all(_check_importable(m) for m in modules):
+        print("  OK")
+        print()
+        return
+    print("Installing the app's packages. This is a one-time step.")
+    result = _run([str(VENV_PYTHON), "-m", "pip", "install",
+                   "--break-system-packages", "-r", str(CLIENT_REQUIREMENTS)])
+    if result.returncode != 0:
+        print("\nERROR: Dependency install failed. See output above.")
+        _pause_and_exit()
     print()
 
 
@@ -484,15 +545,22 @@ def main():
         print(f"ERROR: Could not find {BACKEND_MAIN}")
         _pause_and_exit()
 
+    lightweight = choose_install_kind()  # before ensure_venv: a fresh setup has no llm-env yet
     ensure_venv()
     print(f"Using Python: {VENV_PYTHON}")
     print()
 
-    ensure_comfyui()
-    ensure_dependencies()
-    ensure_comfyui_dependencies()
-    download_default_models()
-    _warn_if_no_models()
+    if lightweight:
+        print("Lightweight install - this computer uses a model shared by another")
+        print("computer on your network. Connect to it in the app's Network panel.")
+        print()
+        ensure_client_dependencies()
+    else:
+        ensure_comfyui()
+        ensure_dependencies()
+        ensure_comfyui_dependencies()
+        download_default_models()
+        _warn_if_no_models()
 
     print(f"Starting backend on port {BACKEND_PORT}...")
     backend_cmd = [str(VENV_PYTHON), "-m", "uvicorn", "main:app",

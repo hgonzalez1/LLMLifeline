@@ -136,6 +136,13 @@ If you're building the zip yourself and want it smaller/faster to transfer, you 
 
 The update packages leave out `persona.txt` and `beliefs/` on purpose. Each release's notes on the [Releases page](https://github.com/hgonzalez1/LLMLifeline/releases) say what changed.
 
+**Network (server mode) files** — kept per computer, never in git:
+- `server/` on a computer sharing its model: its TLS certificate and key, plus its approved devices.
+- `remote.json` on a computer using another's model: the paired server, its pinned certificate, and this device's key for it.
+- `lightweight-install.txt`: present on a lightweight install. Delete it and restart to do a full install on that computer instead.
+
+Server mode listens on port 8100 by default (you can change it in the Network panel). It answers only private and local-network addresses. Its test, which runs real TLS and needs no model, is `llm-env\Scripts\python.exe tests\test_server_mode.py`.
+
 **Computer use settings** live in `permissions.json` in the project folder. Normally you edit them from the app's Permissions panel. Deleting the file turns everything off again. `tests/test_computer_use.py` checks the no-upload rules, with no model needed: `llm-env\Scripts\python.exe tests\test_computer_use.py`.
 
 ---

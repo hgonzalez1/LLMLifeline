@@ -95,6 +95,30 @@ echo.
 echo Using Python: %VENV_PYTHON%
 echo.
 
+REM ---- Lightweight install: uses a model on another computer ----
+REM LLMlifeline.exe writes lightweight-install.txt when this computer was
+REM set up to use another computer's shared model (server mode) instead of
+REM its own — so no ComfyUI, torch, llama-cpp-python or model downloads.
+REM Same as launcher.py's ensure_client_dependencies.
+if not exist "lightweight-install.txt" goto full_install
+echo Lightweight install - this computer uses a model shared by another
+echo computer on your network (connect in the app's Network panel).
+"%VENV_PYTHON%" -c "import fastapi, uvicorn, httpx, multipart, pypdf, zeroconf" 2>nul
+if errorlevel 1 (
+    echo Installing the app's packages. This is a one-time step.
+    "%VENV_PYTHON%" -m pip install --break-system-packages -r "%CD%\backend\requirements-client.txt"
+    if errorlevel 1 (
+        echo.
+        echo ERROR: Dependency install failed. See output above.
+        pause
+        exit /b 1
+    )
+)
+echo.
+goto launch
+
+:full_install
+
 REM ---- Bootstrap 2: clone ComfyUI fresh if it's missing ----
 REM ComfyUI is a real upstream project (github.com/comfyanonymous/ComfyUI),
 REM not code that belongs to this one, so it's never copied/zipped along
@@ -180,6 +204,11 @@ if errorlevel 1 (
 "%VENV_PYTHON%" -c "import pypdf" 2>nul
 if errorlevel 1 (
     echo   Missing: pypdf
+    set NEEDS_INSTALL=1
+)
+"%VENV_PYTHON%" -c "import cryptography, zeroconf" 2>nul
+if errorlevel 1 (
+    echo   Missing: cryptography/zeroconf (needed for Network server mode^)
     set NEEDS_INSTALL=1
 )
 "%VENV_PYTHON%" -c "import multipart" 2>nul
@@ -312,6 +341,7 @@ if %HAS_CHECKPOINTS%==0 (
     echo.
 )
 
+:launch
 REM ---- Launch + auto-open browser ----
 REM Runs uvicorn in its own minimized window rather than blocking this
 REM one, so this script can poll for readiness and then open the browser

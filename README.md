@@ -51,6 +51,30 @@ What it can't promise: a program can do anything once it runs. LLMlifeline check
 
 Small models follow the step format less reliably. A bigger chat model will build things far better.
 
+### Sharing one model across your home network
+
+Click **🖧 Network** in the sidebar. One computer, usually the one with the strongest graphics card, shares its model, and the other computers on your network use it. Every computer keeps its own projects, chats, files, persona, beliefs and computer-use permissions. The computer actions the assistant takes always run on the computer you're using.
+
+**On the computer sharing its model:**
+- Tick **"Let devices on my network use this computer's model"**. The panel shows the address other computers connect to.
+- If Windows asks whether to allow LLMlifeline on networks, allow **private networks only**.
+- When a device asks to connect, it appears in the panel and on the sidebar button ("1 waiting"). It shows a 6-digit code. Approve it only if the device shows the same code.
+- The Devices list shows who's connected now. **Boot** disconnects a device; it can ask to pair again, and you'd approve it again. **Block** refuses it until you unblock it. **Forget** removes it.
+- Two options: whether devices can generate images and describe photos (only while this computer is in Image mode), and whether they can change its model or switch it between chat and images. Switching is off by default, because it changes the model for everyone.
+
+**On a computer using another's model:** click **Find computers on my network**, or type the other computer's address, then **Connect**. A code appears; check that the other computer shows the same one, and have it approve. The status bar then shows "Ready · <that computer's name>". **Use this computer's own model** switches back, and **Forget** unpairs. If the other computer boots it, the panel offers **Pair again**.
+
+**What the sharing computer sees and keeps:**
+- To answer a request it has to read it: the recent chat, persona and any file text in it, or a photo to describe. It holds that only in memory while working.
+- Nothing from a request or reply is saved, logged or sent anywhere else.
+- It keeps each device's name, when it paired, and when and from which address it was last seen.
+- Connections are encrypted, and only devices on your local network are answered.
+- The 6-digit code proves to each device that it's talking to the real computer and not an impostor.
+
+The one thing code can't promise: whoever controls the sharing computer could change its software. Use it with people who trust that computer.
+
+**A computer without a good graphics card** can skip the heavy install entirely. On a fresh setup, LLMlifeline asks where its model will run. Choosing "on another computer" makes a lightweight install of under 1 GB, with no models, no image tools and no GPU libraries. Everything waits on one shared model, so expect a queue when several people use it at once. The sharing computer either needs to be powerful or should run a smaller, faster model.
+
 ### Uploading images and documents
 
 Click the 📎 button next to the message box to upload a photo (it gets captioned automatically, so you can ask about it) or a document — PDF, .txt, or .md (it gets indexed, so the assistant can find and quote relevant passages later, even in a different conversation).

@@ -585,6 +585,90 @@
   }
   #permissions-error { color: #e57373; font-size: 12.5px; min-height: 1em; margin-top: 8px; }
   #permissions-footer { display: flex; justify-content: space-between; margin-top: 16px; }
+
+  /* ---- Network: server mode and using another computer's model ---- */
+  #network-btn {
+    background: transparent;
+    color: var(--text);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 7px 10px;
+    font-size: 13px;
+    cursor: pointer;
+    margin-bottom: 12px;
+    text-align: left;
+  }
+  #network-btn:hover { border-color: #555; }
+  #network-btn .perm-state { float: right; color: var(--muted); font-size: 12px; }
+  #network-btn.attention { border-color: #d9a843; }
+  #network-btn.attention .perm-state { color: #d9a843; font-weight: 600; }
+  #network-overlay {
+    display: none;
+    position: fixed; inset: 0;
+    background: rgba(0,0,0,0.5);
+    align-items: center; justify-content: center;
+    z-index: 10;
+  }
+  #network-overlay.visible { display: flex; }
+  #network-box {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 20px;
+    width: min(620px, calc(100vw - 32px));
+    max-height: calc(100vh - 40px);
+    overflow-y: auto;
+    font-size: 14px;
+  }
+  #network-box h3 { margin: 0 0 4px; font-size: 16px; }
+  #network-box h4 { margin: 20px 0 6px; font-size: 13px; text-transform: uppercase; letter-spacing: 0.05em; color: var(--muted); }
+  #network-box .perm-help { color: var(--muted); font-size: 12.5px; margin: 4px 0 8px; line-height: 1.45; }
+  #network-box button {
+    border: 1px solid var(--border);
+    background: #2f2f30;
+    color: var(--text);
+    border-radius: 6px;
+    padding: 6px 12px;
+    font-size: 13px;
+    cursor: pointer;
+  }
+  #network-box button.primary { background: var(--accent); border-color: var(--accent); color: white; }
+  #network-box button.danger { border-color: #8a3b3b; color: #f0a0a0; }
+  #network-box button:disabled { opacity: 0.5; cursor: not-allowed; }
+  #network-box input[type=text], #network-box input[type=number] {
+    background: #2f2f30;
+    color: var(--text);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 6px 8px;
+    font-size: 13px;
+    min-width: 0;
+  }
+  #network-box .net-row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin-bottom: 6px; }
+  #network-box .net-row input[type=text] { flex: 1; }
+  #network-box .net-row input[type=number] { width: 90px; }
+  #network-box .net-card {
+    padding: 10px 12px; margin-bottom: 6px;
+    background: #2a2a2b; border-radius: 8px; font-size: 13px;
+    display: flex; gap: 10px; align-items: center; flex-wrap: wrap;
+  }
+  #network-box .net-card .net-card-text { flex: 1; min-width: 180px; }
+  #network-box .net-card .net-sub { color: var(--muted); font-size: 12px; margin-top: 2px; }
+  #network-box .net-card.pending { border: 1px solid #d9a843; background: #2f2a1a; }
+  #network-box .net-code { font-family: Consolas, Menlo, monospace; font-size: 22px; letter-spacing: 0.15em; font-weight: 600; }
+  #network-box .net-dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 6px; background: #666; }
+  #network-box .net-dot.on { background: #4caf50; }
+  #network-box .net-dot.blocked { background: #e57373; }
+  #network-box .net-check { display: flex; gap: 10px; align-items: flex-start; margin: 8px 0; cursor: pointer; }
+  #network-box .net-check input { margin-top: 3px; }
+  #network-box .net-note {
+    margin-top: 14px; padding: 10px 12px;
+    border: 1px solid #3c6e4a; background: #1d2b21;
+    border-radius: 8px; font-size: 12.5px; line-height: 1.5;
+  }
+  #network-box .net-empty { color: var(--muted); font-size: 12.5px; font-style: italic; }
+  #network-error { color: #e57373; font-size: 12.5px; min-height: 1em; margin-top: 8px; }
+  #network-footer { display: flex; justify-content: flex-end; margin-top: 16px; }
 </style>
 </head>
 <body>
@@ -593,6 +677,7 @@
     <h2>Projects</h2>
     <button id="new-project-btn">+ New Project</button>
     <button id="permissions-btn" title="What the assistant may do on this computer">🔐 Computer use <span class="perm-state" id="permissions-state">Off</span></button>
+    <button id="network-btn" title="Share this computer's model on your network, or use another computer's">🖧 Network <span class="perm-state" id="network-state">Off</span></button>
     <div id="project-list"></div>
     <div id="conversation-section">
       <h2>Conversations</h2>
@@ -701,6 +786,22 @@
         <button id="perm-revoke-all">Revoke everything</button>
         <button id="perm-done" class="primary">Done</button>
       </div>
+    </div>
+  </div>
+
+  <div id="network-overlay">
+    <div id="network-box">
+      <h3>Network</h3>
+      <div class="perm-help">Computers on your home network can share one model. The computer with the most powerful GPU runs it, and the others use it. Every computer keeps its own projects, chats, files and settings.</div>
+
+      <h4>Use a model on another computer</h4>
+      <div id="net-client"></div>
+
+      <h4>Share this computer's model</h4>
+      <div id="net-server"></div>
+
+      <div id="network-error"></div>
+      <div id="network-footer"><button id="net-done" class="primary">Done</button></div>
     </div>
   </div>
 
@@ -815,6 +916,14 @@ async function checkHealth() {
     } else {
       setStatus("bad", data.loading_elapsed_seconds ?? undefined);
     }
+    if (data.remote && data.remote.name) {
+      // Using another computer's model — say whose.
+      el("status-label").textContent += ` · ${data.remote.name}`;
+      el("status-label").title = data.remote.error || "";
+    }
+    // That computer manages its own restarts and context length.
+    el("restart-btn").disabled = !!data.remote;
+    el("extended-context-btn").disabled = !!data.remote;
     syncExtendedContextButton(data.extended_context);
   } catch {
     setStatus("bad");
@@ -1630,6 +1739,316 @@ el("perm-revoke-all").addEventListener("click", () => {
   }
 });
 
+// ---------- Network: server mode and using another computer's model ----------
+// GET /api/network has both halves. While the panel is open it refreshes
+// every 2.5s (pairing requests and connected devices change on their
+// own); otherwise a slower poll keeps the sidebar badge current, so a
+// device asking to pair is noticed without the panel open. Only the
+// parts that changed are redrawn, so typing in a field isn't wiped.
+
+let network = null;
+let discovered = [];
+let networkPanelTimer = null;
+const networkSigs = {};
+
+/** Tiny element builder. Strings become text nodes, so names other devices send are never parsed as HTML. */
+function h(tag, props = {}, ...children) {
+  const node = document.createElement(tag);
+  Object.entries(props).forEach(([k, v]) => {
+    if (k === "class") node.className = v;
+    else if (k.startsWith("on")) node.addEventListener(k.slice(2), v);
+    else if (k === "checked" || k === "disabled") node[k] = !!v;
+    else if (v !== undefined && v !== null) node.setAttribute(k, v);
+  });
+  children.flat().forEach((c) => { if (c !== null && c !== undefined && c !== false) node.append(c); });
+  return node;
+}
+
+async function apiJson(method, path, body) {
+  const res = await fetch(`${API_BASE}${path}`, {
+    method,
+    headers: body ? { "Content-Type": "application/json" } : {},
+    body: body ? JSON.stringify(body) : undefined,
+  });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(data.detail || `${method} ${path} failed: ${res.status}`);
+  return data;
+}
+
+async function networkAction(fn) {
+  el("network-error").textContent = "";
+  try {
+    const data = await fn();
+    if (data && data.server) {
+      network = data;
+      updateNetworkButton();
+      renderNetwork();
+    }
+    return data;
+  } catch (e) {
+    el("network-error").textContent = e.message;
+    return null;
+  }
+}
+
+function updateNetworkButton() {
+  if (!network) return;
+  const pending = network.server.pending.length;
+  const state = el("network-state");
+  el("network-btn").classList.toggle("attention", pending > 0);
+  if (pending > 0) state.textContent = `${pending} waiting`;
+  else if (network.client.active && network.client.server) state.textContent = `Using ${network.client.server.name}`;
+  else if (network.server.running) {
+    const connected = network.server.devices.filter((d) => d.connected).length;
+    state.textContent = connected ? `Sharing · ${connected}` : "Sharing";
+  } else state.textContent = network.lightweight ? "Not connected" : "Off";
+}
+
+async function refreshNetwork() {
+  try {
+    network = await apiGet("/api/network");
+  } catch {
+    return;
+  }
+  // A pairing this computer started: ask the server whether it's been answered.
+  if (network.client.pairing) {
+    try {
+      const data = await apiJson("POST", "/api/network/client/pair/check");
+      network = data;
+      if (data.pairing_status === "approved") onRemoteChanged();
+      if (data.pairing_status === "denied") el("network-error").textContent = "The other computer said no.";
+      if (data.pairing_status === "expired") el("network-error").textContent = "The request timed out. Try connecting again.";
+    } catch (e) {
+      el("network-error").textContent = e.message;
+    }
+  }
+  updateNetworkButton();
+  if (el("network-overlay").classList.contains("visible")) renderNetwork();
+}
+
+/** After switching between this computer's model and another's: everything model-related comes from somewhere else now. */
+async function onRemoteChanged() {
+  await loadModels();
+  await loadCheckpoints();
+  await checkHealth();
+}
+
+function renderNetwork() {
+  if (!network) return;
+  const c = network.client;
+  const clientSig = JSON.stringify([c.active, c.server, c.pairing, c.error, network.lightweight, discovered,
+    c.last_info && [c.last_info.model, c.last_info.mode]]);
+  if (networkSigs.client !== clientSig) {
+    networkSigs.client = clientSig;
+    renderNetworkClient();
+  }
+  const s = network.server;
+  const settingsSig = JSON.stringify([s.enabled, s.running, s.error, s.name, s.port, s.addresses, s.allow_images,
+    s.allow_switching, network.lightweight, c.active]);
+  if (networkSigs.settings !== settingsSig) {
+    networkSigs.settings = settingsSig;
+    networkSigs.live = null; // the settings redraw recreated the live area
+    renderNetworkServerSettings();
+  }
+  // A connected device's last-seen time ticks on every request; leaving it
+  // out keeps buttons in place instead of redrawing them under the cursor.
+  const liveSig = JSON.stringify([s.pending, s.devices.map((d) => ({ ...d, last_seen: d.connected ? 0 : d.last_seen }))]);
+  if (networkSigs.live !== liveSig) {
+    networkSigs.live = liveSig;
+    renderNetworkServerLive();
+  }
+}
+
+function renderNetworkClient() {
+  const box = el("net-client");
+  box.innerHTML = "";
+  const c = network.client;
+  if (network.lightweight) {
+    box.append(h("div", { class: "perm-help" }, "This is a lightweight install. It has no model of its own, so it uses one shared by another computer."));
+  }
+  if (c.pairing) {
+    box.append(h("div", { class: "net-card pending" },
+      h("div", { class: "net-card-text" },
+        h("div", {}, `Asking ${c.pairing.name} to connect…`),
+        h("div", { class: "net-sub" }, `On ${c.pairing.name}, open 🖧 Network and approve this computer only if it shows this same code:`)),
+      h("div", { class: "net-code" }, c.pairing.code),
+      h("button", { onclick: () => networkAction(() => apiJson("POST", "/api/network/client/pair/cancel")) }, "Cancel")));
+    return;
+  }
+  if (c.server) {
+    const info = c.last_info || {};
+    const detail = c.active && info.model ? (info.mode === "image" ? " · image mode" : ` · ${info.model}`) : "";
+    box.append(h("div", { class: "net-card" },
+      h("div", { class: "net-card-text" },
+        h("div", {}, h("span", { class: `net-dot ${c.active && !c.error ? "on" : ""}` }), c.active ? `Using ${c.server.name}` : `Paired with ${c.server.name}`),
+        h("div", { class: "net-sub" }, `${c.server.host}:${c.server.port}${detail}`),
+        c.error ? h("div", { class: "net-sub", style: "color:#e57373" }, c.error) : null),
+      c.error ? h("button", { class: "primary", onclick: () => startPairing(c.server.host, c.server.port) }, "Pair again") : null,
+      c.active
+        ? (network.lightweight ? null : h("button", { onclick: () => setRemote(false) }, "Use this computer's own model"))
+        : h("button", { class: "primary", onclick: () => setRemote(true) }, `Use ${c.server.name}`),
+      h("button", {
+        class: "danger",
+        onclick: () => {
+          if (!confirm(`Forget ${c.server.name}? You'd need to pair again to use it.`)) return;
+          networkAction(async () => {
+            const data = await apiJson("POST", "/api/network/client/forget");
+            onRemoteChanged();
+            return data;
+          });
+        },
+      }, "Forget")));
+    return;
+  }
+  const hostInput = h("input", { type: "text", placeholder: "Its address, e.g. 192.168.1.20" });
+  const portInput = h("input", { type: "number", value: "8100", min: "1024", max: "65535", title: "Port" });
+  const connect = () => startPairing(hostInput.value, portInput.value);
+  hostInput.addEventListener("keydown", (e) => { if (e.key === "Enter") connect(); });
+  box.append(
+    h("div", { class: "net-row" }, h("button", { id: "net-find", onclick: findServers }, "Find computers on my network")),
+    ...discovered.map((s) => h("div", { class: "net-card" },
+      h("div", { class: "net-card-text" }, h("div", {}, s.name), h("div", { class: "net-sub" }, `${s.host}:${s.port}`)),
+      h("button", { class: "primary", onclick: () => startPairing(s.host, s.port) }, "Connect"))),
+    h("div", { class: "net-row" }, hostInput, portInput, h("button", { onclick: connect }, "Connect")),
+    h("div", { class: "perm-help" }, "The other computer needs LLMlifeline open with \"Share this computer's model\" turned on. Its Network panel shows its address."));
+}
+
+async function findServers() {
+  const button = el("net-find");
+  button.disabled = true;
+  button.textContent = "Looking…";
+  el("network-error").textContent = "";
+  try {
+    discovered = (await apiGet("/api/network/discover")).servers;
+    if (discovered.length === 0) {
+      el("network-error").textContent = "No computers found. Some networks block this, so type the address instead.";
+    }
+  } catch (e) {
+    el("network-error").textContent = e.message;
+  }
+  networkSigs.client = null;
+  renderNetwork();
+}
+
+function startPairing(host, port) {
+  host = String(host || "").trim();
+  port = parseInt(port, 10) || 8100;
+  if (!host) {
+    el("network-error").textContent = "Type the other computer's address first.";
+    return;
+  }
+  networkAction(() => apiJson("POST", "/api/network/client/pair", { host, port }));
+}
+
+function setRemote(on) {
+  networkAction(async () => {
+    const data = await apiJson("POST", "/api/network/client/active", { active: on });
+    onRemoteChanged();
+    return data;
+  });
+}
+
+function saveServer(changes) {
+  return networkAction(() => apiJson("PUT", "/api/network/server", changes));
+}
+
+function renderNetworkServerSettings() {
+  const box = el("net-server");
+  box.innerHTML = "";
+  const s = network.server;
+  if (network.lightweight) {
+    box.append(h("div", { class: "perm-help" }, "This lightweight install has no model to share."));
+    return;
+  }
+  if (network.client.active) {
+    box.append(h("div", { class: "perm-help" }, "This computer is using another computer's model, so it can't share one. Switch back to its own model first."));
+    return;
+  }
+  const enabled = h("input", { type: "checkbox", checked: s.enabled, onchange: (e) => saveServer({ enabled: e.target.checked }) });
+  box.append(h("label", { class: "net-check" }, enabled,
+    h("span", {}, "Let devices on my network use this computer's model. Each one has to be approved here first.")));
+  if (s.error) box.append(h("div", { class: "perm-help", style: "color:#e57373" }, s.error));
+  if (s.running) {
+    const where = s.addresses.length ? s.addresses.map((a) => `${a}`).join(" or ") : "this computer's network address";
+    box.append(h("div", { class: "net-card" }, h("div", { class: "net-card-text" },
+      h("div", {}, h("span", { class: "net-dot on" }), `Sharing as ${s.name}`),
+      h("div", { class: "net-sub" }, `Other computers connect to ${where}, port ${s.port}. If Windows asks whether to allow LLMlifeline on networks, allow private networks only.`))));
+  }
+  box.append(
+    h("label", { class: "net-check" },
+      h("input", { type: "checkbox", checked: s.allow_images, onchange: (e) => saveServer({ allow_images: e.target.checked }) }),
+      h("span", {}, "Devices can generate images and describe their photos (images only while this computer is in Image mode).")),
+    h("label", { class: "net-check" },
+      h("input", { type: "checkbox", checked: s.allow_switching, onchange: (e) => saveServer({ allow_switching: e.target.checked }) }),
+      h("span", {}, "Devices can change this computer's model and switch it between chat and images. That changes it for everyone, you included.")));
+  const nameInput = h("input", { type: "text", value: s.name, placeholder: "Name devices see", maxlength: "60" });
+  const portInput = h("input", { type: "number", value: String(s.port), min: "1024", max: "65535", title: "Port" });
+  box.append(h("div", { class: "net-row" }, nameInput, portInput,
+    h("button", { onclick: () => saveServer({ name: nameInput.value, port: parseInt(portInput.value, 10) }) }, "Save")));
+  box.append(h("div", { id: "net-live" }));
+  box.append(h("div", { class: "net-note" },
+    h("strong", {}, "What this computer sees and keeps. "),
+    "To answer a device, this computer has to read that request: the recent chat, persona and any file text it includes, or a photo to describe. It holds that only in memory while working. Nothing from a request or reply is saved, logged or sent anywhere else. It keeps just each device's name, when it paired, and when and from which address it was last seen. Connections are encrypted and only answered on your local network. Each device's projects, chats and files stay on that device."));
+}
+
+function renderNetworkServerLive() {
+  const box = el("net-live");
+  if (!box) return;
+  box.innerHTML = "";
+  const s = network.server;
+  s.pending.forEach((p) => box.append(h("div", { class: "net-card pending" },
+    h("div", { class: "net-card-text" },
+      h("div", {}, `${p.device_name} wants to use this computer's model`),
+      h("div", { class: "net-sub" }, `From ${p.ip || "an unknown address"}. Approve only if that computer shows the same code:`)),
+    h("div", { class: "net-code" }, p.code),
+    h("button", { class: "primary", onclick: () => networkAction(() => apiJson("POST", `/api/network/server/pairing/${p.id}`, { approve: true })) }, "Approve"),
+    h("button", { onclick: () => networkAction(() => apiJson("POST", `/api/network/server/pairing/${p.id}`, { approve: false })) }, "Deny"))));
+  if (s.devices.length === 0) {
+    if (s.running && s.pending.length === 0) box.append(h("div", { class: "net-empty" }, "No devices yet."));
+    return;
+  }
+  s.devices.forEach((d) => {
+    const status = d.blocked ? "Blocked"
+      : d.connected ? "Connected now"
+      : !d.paired ? "Disconnected. It can ask to pair again."
+      : d.last_seen ? `Last seen ${formatTimestamp(new Date(d.last_seen * 1000).toISOString())}` : "Paired";
+    const act = (action, label, cls) => h("button", {
+      class: cls || "",
+      onclick: () => {
+        if (action === "forget" && !confirm(`Forget ${d.name}? It would have to ask to pair again.`)) return;
+        networkAction(() => apiJson("POST", `/api/network/server/devices/${encodeURIComponent(d.id)}/${action}`));
+      },
+    }, label);
+    box.append(h("div", { class: "net-card" },
+      h("div", { class: "net-card-text" },
+        h("div", {}, h("span", { class: `net-dot ${d.blocked ? "blocked" : d.connected ? "on" : ""}` }), d.name),
+        h("div", { class: "net-sub" }, [d.last_ip, status].filter(Boolean).join(" · "))),
+      d.paired && !d.blocked ? act("boot", "Boot") : null,
+      d.blocked ? act("unblock", "Unblock") : act("block", "Block", "danger"),
+      act("forget", "Forget")));
+  });
+}
+
+async function openNetwork() {
+  networkSigs.client = networkSigs.settings = networkSigs.live = null;
+  el("network-error").textContent = "";
+  el("network-overlay").classList.add("visible");
+  await refreshNetwork();
+  renderNetwork();
+  clearInterval(networkPanelTimer);
+  networkPanelTimer = setInterval(refreshNetwork, 2500);
+}
+
+function closeNetwork() {
+  el("network-overlay").classList.remove("visible");
+  clearInterval(networkPanelTimer);
+}
+
+el("network-btn").addEventListener("click", openNetwork);
+el("net-done").addEventListener("click", closeNetwork);
+el("network-overlay").addEventListener("click", (e) => { if (e.target === el("network-overlay")) closeNetwork(); });
+setInterval(() => { if (!el("network-overlay").classList.contains("visible")) refreshNetwork(); }, 6000);
+
 // ---------- File uploads ----------
 // Separate from sendMessage's text-only flow: an upload has its own
 // endpoint (multipart, not JSON) and works the same regardless of
@@ -1691,6 +2110,7 @@ el("lightbox-overlay").addEventListener("click", (e) => {
 document.addEventListener("keydown", (e) => {
   if (e.key === "Escape" && el("lightbox-overlay").classList.contains("visible")) closeLightbox();
   if (e.key === "Escape") el("permissions-overlay").classList.remove("visible");
+  if (e.key === "Escape" && el("network-overlay").classList.contains("visible")) closeNetwork();
 });
 
 el("send-btn").addEventListener("click", sendMessage);
@@ -1771,6 +2191,7 @@ el("modal-input").addEventListener("keydown", (e) => {
   await loadCheckpoints();
   await loadProjects();
   refreshPermissionsState();
+  refreshNetwork();
   applyModeToControls(); // activeMode starts "chat" — checkpoint-select disabled, chat controls enabled
   el("model-select").addEventListener("change", (e) => {
     if (e.target.value && e.target.value !== selectedModel) {

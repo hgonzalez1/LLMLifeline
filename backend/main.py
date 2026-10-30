@@ -27,6 +27,8 @@ owns that process's whole lifecycle.
 """
 
 import asyncio
+import base64
+import io
 import json
 import os
 import random
@@ -35,6 +37,7 @@ import subprocess
 import sys
 import time
 import uuid
+import contextlib
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path
@@ -47,6 +50,8 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 import computer_use
+import remote_client
+import server_mode
 
 # ---- Configuration ----
 
@@ -77,6 +82,10 @@ DEFAULT_MODEL = MODELS_DIR / "Qwen3-30B-A3B-Q4_K_M.gguf"
 LLAMA_SERVER_STARTUP_TIMEOUT = 600  # seconds — cold loads on this hardware have taken up to ~10 min
 
 PROJECTS_DIR.mkdir(parents=True, exist_ok=True)
+
+# Written by the launcher when this computer was set up to use a model on
+# another computer instead of its own (no GPU stack, no models, no ComfyUI).
+LIGHTWEIGHT_MARKER = APP_ROOT / "lightweight-install.txt"
 
 # Nothing this app starts should report usage anywhere — Hugging Face
 # downloads, ComfyUI, or tools the assistant runs. Child processes
@@ -132,13 +141,30 @@ def _caption_image(image_path: Path) -> str:
     image is less grounded, not that the image itself failed to
     generate/upload.
     """
+    return _caption_bytes(image_path.read_bytes())
+
+
+def _caption_bytes(image: bytes) -> str:
+    """Same as _caption_image, from bytes in memory — what server mode uses
+    for a device's photo, so it's never written to this computer's disk."""
     from PIL import Image
 
     _load_blip()
-    raw_image = Image.open(image_path).convert("RGB")
+    raw_image = Image.open(io.BytesIO(image)).convert("RGB")
     inputs = _blip_processor(raw_image, return_tensors="pt").to(_blip_device)
     output = _blip_model.generate(**inputs, max_new_tokens=50)
     return _blip_processor.decode(output[0], skip_special_tokens=True).strip()
+
+
+async def _caption_for(image_path: Path) -> str:
+    """Captions with the paired server's model when using one, otherwise locally."""
+    if remote_client.active():
+        try:
+            result = await remote_client.call("POST", "/v1/caption", content=image_path.read_bytes(), timeout=300)
+        except remote_client.RemoteError as e:
+            raise RuntimeError(e.detail)
+        return result.get("caption")
+    return _caption_image(image_path)
 
 
 # ---- llama_cpp.server process management ----
@@ -493,8 +519,9 @@ async def lifespan(app: FastAPI):
     # Startup: launch llama_cpp.server with a default model, so Chat
     # Model (the default-checked mode in the UI) is actually usable the
     # moment the backend comes up, not just after a manual dropdown pick.
+    # (Not when this computer uses another computer's model instead.)
     default_model = _default_gguf_path()
-    if default_model:
+    if default_model and not remote_client.active():
         llama_manager.start(str(default_model))
         await _wait_for_server_ready()
 
@@ -509,8 +536,12 @@ async def lifespan(app: FastAPI):
     if default_checkpoints:
         image_manager.current_checkpoint = default_checkpoints[0].name
 
+    if server.settings["enabled"] and not remote_client.active():
+        await server.start()
+
     yield
     # Shutdown: make sure we don't leave orphaned subprocesses running.
+    await server.stop()
     llama_manager.stop()
     image_manager.stop()
 
@@ -604,11 +635,27 @@ def _list_checkpoint_files() -> list[Path]:
 
 # ---- Models folder scanning ----
 
+async def _remote(method: str, path: str, body: dict | None = None, timeout: float = 900.0) -> dict:
+    """Calls the paired server (see remote_client), turning its errors into
+    ones the page can show."""
+    try:
+        return await remote_client.call(method, path, json_body=body, timeout=timeout)
+    except remote_client.RemoteError as e:
+        raise HTTPException(status_code=e.status_code, detail=e.detail)
+
+
 @app.get("/api/models")
-def list_models():
-    """Return every .gguf file in the models folder, flagging which one is currently loaded."""
+async def list_models():
+    """Return every .gguf file in the models folder, flagging which one is
+    currently loaded — or, when using another computer's model, that
+    computer's list (each entry's "path" is then its filename there)."""
+    if remote_client.active():
+        info = await _remote("GET", "/v1/info", timeout=10)
+        return {"models": [{"filename": m["filename"], "path": m["filename"], "size_gb": m["size_gb"],
+                            "active": m["active"]} for m in info.get("models", [])],
+                "remote": True}
     if not MODELS_DIR.exists():
-        raise HTTPException(status_code=500, detail=f"Models directory not found: {MODELS_DIR}")
+        MODELS_DIR.mkdir(parents=True, exist_ok=True)  # a lightweight install starts without one
 
     gguf_files = sorted(MODELS_DIR.glob("*.gguf"))
     return {
@@ -634,6 +681,10 @@ async def start_image_server():
     steps once this proves ComfyUI itself launches correctly from this
     backend's subprocess-management pattern.
     """
+    if remote_client.active():
+        await _remote("POST", "/v1/mode", {"mode": "image"}, timeout=400)
+        return {"status": "ok", "remote": True}
+
     async with image_manager.lock:
         image_manager.start()
         ready = await _wait_for_comfyui_ready()
@@ -650,6 +701,10 @@ async def start_image_server():
 @app.post("/api/image/stop")
 async def stop_image_server():
     """Stop the ComfyUI process, if running."""
+    if remote_client.active():
+        # On the way back to Chat Model: ask the server to switch back.
+        await _remote("POST", "/v1/mode", {"mode": "chat"}, timeout=700)
+        return {"status": "ok", "was_running": True}
     async with image_manager.lock:
         was_running = image_manager.is_alive()
         image_manager.stop()
@@ -659,6 +714,12 @@ async def stop_image_server():
 @app.get("/api/image/health")
 async def image_health():
     """Confirm whether ComfyUI is currently running and reachable."""
+    if remote_client.active():
+        try:
+            info = await remote_client.info()
+        except remote_client.RemoteError:
+            return {"comfyui": "unreachable"}
+        return {"comfyui": "ok" if info.get("mode") == "image" and info.get("allow_images") else "not running"}
     if not image_manager.is_alive():
         return {"comfyui": "not running"}
 
@@ -671,15 +732,18 @@ async def image_health():
 
 
 @app.get("/api/image/checkpoints")
-def list_checkpoints():
+async def list_checkpoints():
     """
     Return every checkpoint file in ComfyUI's checkpoints folder, flagging
     which one is currently selected. Mirrors /api/models's shape/pattern
     exactly (filename, size, active flag) so the frontend dropdown can
     reuse the same rendering logic as the chat-model dropdown.
     """
+    if remote_client.active():
+        info = await _remote("GET", "/v1/info", timeout=10)
+        return {"checkpoints": info.get("checkpoints", []), "remote": True}
     if not COMFYUI_CHECKPOINTS_DIR.exists():
-        raise HTTPException(status_code=500, detail=f"Checkpoints directory not found: {COMFYUI_CHECKPOINTS_DIR}")
+        return {"checkpoints": []}  # no ComfyUI here (e.g. a lightweight install)
 
     checkpoint_files = _list_checkpoint_files()
     return {
@@ -695,7 +759,7 @@ def list_checkpoints():
 
 
 @app.post("/api/image/checkpoint")
-def set_checkpoint(request: SetCheckpointRequest):
+async def set_checkpoint(request: SetCheckpointRequest):
     """
     Record which checkpoint filename image-generation requests should use.
     Unlike swapping a chat model, this does NOT restart ComfyUI or touch
@@ -708,6 +772,9 @@ def set_checkpoint(request: SetCheckpointRequest):
     # boundary as _resolve_project_file, so a value like
     # "../../../whatever.safetensors" can't select a file outside this
     # folder even though it'd pass a naive exists()+suffix check.
+    if remote_client.active():
+        await _remote("POST", "/v1/images/checkpoint", {"checkpoint": request.checkpoint}, timeout=30)
+        return {"status": "ok", "active_checkpoint": request.checkpoint}
     checkpoints_dir_resolved = COMFYUI_CHECKPOINTS_DIR.resolve()
     checkpoint_path = (COMFYUI_CHECKPOINTS_DIR / request.checkpoint).resolve()
     try:
@@ -774,10 +841,21 @@ async def generate_image(request: GenerateImageRequest, background_tasks: Backgr
     """
     _require_project(request.project_id)
 
-    if not image_manager.is_alive():
-        raise HTTPException(status_code=503, detail="ComfyUI is not running. Switch to Image Model first.")
-    if not image_manager.current_checkpoint:
-        raise HTTPException(status_code=400, detail="No checkpoint selected. Pick one from the checkpoint dropdown first.")
+    if remote_client.active():
+        # The paired server draws it; the picture and the conversation are
+        # saved here, on this device, like any other image.
+        try:
+            result = await remote_client.call("POST", "/v1/images/generate", json_body={"prompt": request.prompt},
+                                              timeout=600)
+        except remote_client.RemoteError as e:
+            raise HTTPException(status_code=e.status_code, detail=e.detail)
+        png, caption, checkpoint = base64.b64decode(result["image_base64"]), result.get("caption"), result.get("checkpoint")
+    else:
+        if not image_manager.is_alive():
+            raise HTTPException(status_code=503, detail="ComfyUI is not running. Switch to Image Model first.")
+        if not image_manager.current_checkpoint:
+            raise HTTPException(status_code=400, detail="No checkpoint selected. Pick one from the checkpoint dropdown first.")
+        png, caption, checkpoint = await _comfy_txt2img(request.prompt), None, image_manager.current_checkpoint
 
     conversation_id = request.conversation_id or str(uuid.uuid4())
     conversation = _load_conversation(request.project_id, conversation_id)
@@ -789,8 +867,72 @@ async def generate_image(request: GenerateImageRequest, background_tasks: Backgr
         "timestamp": datetime.now(timezone.utc).isoformat(),
     })
 
+    # Saved under our own control, keyed by project — separate from
+    # projects/*/files/ since that folder's read endpoint only handles
+    # UTF-8 text, not binary image bytes.
+    project_images_dir = GENERATED_IMAGES_DIR / request.project_id
+    project_images_dir.mkdir(parents=True, exist_ok=True)
+    saved_filename = f"{uuid.uuid4().hex}.png"
+    saved_path = project_images_dir / saved_filename
+    saved_path.write_bytes(png)
+
+    image_url = f"/api/image/generated/{request.project_id}/{saved_filename}"
+
+    # Caption the actual pixels, not just the prompt — the prompt is what
+    # was ASKED for, not necessarily what the model actually drew. This is
+    # what lets a later "describe that image" question in this same
+    # conversation get a real answer instead of the model just echoing
+    # the prompt back or guessing. A caption failure is non-fatal — the
+    # image itself is already saved and returned either way. (A paired
+    # server already captioned it with its own model.)
+    if caption is None and not remote_client.active():
+        try:
+            caption = _caption_image(saved_path)
+        except Exception as e:
+            print(f"[backend] Image captioning failed for {saved_path}: {e}")
+            caption = None
+
+    content = f'Generated an image for: "{request.prompt}"'
+    if caption:
+        content += f"\n\nDescription: {caption}"
+
+    assistant_timestamp = datetime.now(timezone.utc).isoformat()
+    conversation["messages"].append({
+        "role": "assistant",
+        "content": content,
+        "image_url": image_url,
+        "image_caption": caption,
+        "timestamp": assistant_timestamp,
+    })
+    _save_conversation(conversation)
+
+    if is_new_conversation:
+        # Usually a no-op in practice: Chat and Image Model are mutually
+        # exclusive, so llama_cpp.server is normally stopped whenever
+        # this endpoint runs, and _generate_conversation_title bails out
+        # immediately when it is. Still fired for the rare case it isn't
+        # (a mode switch mid-flight) — harmless either way, and the
+        # prompt text itself is already a reasonable fallback title via
+        # list_conversations' plain preview.
+        background_tasks.add_task(
+            _title_background_task, request.project_id, conversation_id, request.prompt
+        )
+
+    return {
+        "conversation_id": conversation_id,
+        "project_id": request.project_id,
+        "image_url": image_url,
+        "caption": caption,
+        "timestamp": assistant_timestamp,
+        "checkpoint": checkpoint,
+    }
+
+
+async def _comfy_txt2img(prompt: str) -> bytes:
+    """One image from this computer's ComfyUI, with the selected
+    checkpoint — shared by this computer's own Image Model and server mode."""
     workflow = _build_txt2img_workflow(
-        image_manager.current_checkpoint, request.prompt, random.randint(0, 2**32 - 1)
+        image_manager.current_checkpoint, prompt, random.randint(0, 2**32 - 1)
     )
     client_id = uuid.uuid4().hex
 
@@ -867,63 +1009,7 @@ async def generate_image(request: GenerateImageRequest, background_tasks: Backgr
         )
         view_resp.raise_for_status()
 
-    # Saved under our own control, keyed by project — separate from
-    # projects/*/files/ since that folder's read endpoint only handles
-    # UTF-8 text, not binary image bytes.
-    project_images_dir = GENERATED_IMAGES_DIR / request.project_id
-    project_images_dir.mkdir(parents=True, exist_ok=True)
-    saved_filename = f"{uuid.uuid4().hex}.png"
-    saved_path = project_images_dir / saved_filename
-    saved_path.write_bytes(view_resp.content)
-
-    image_url = f"/api/image/generated/{request.project_id}/{saved_filename}"
-
-    # Caption the actual pixels, not just the prompt — the prompt is what
-    # was ASKED for, not necessarily what the model actually drew. This is
-    # what lets a later "describe that image" question in this same
-    # conversation get a real answer instead of the model just echoing
-    # the prompt back or guessing. A caption failure is non-fatal — the
-    # image itself is already saved and returned either way.
-    try:
-        caption = _caption_image(saved_path)
-    except Exception as e:
-        print(f"[backend] Image captioning failed for {saved_path}: {e}")
-        caption = None
-
-    content = f'Generated an image for: "{request.prompt}"'
-    if caption:
-        content += f"\n\nDescription: {caption}"
-
-    assistant_timestamp = datetime.now(timezone.utc).isoformat()
-    conversation["messages"].append({
-        "role": "assistant",
-        "content": content,
-        "image_url": image_url,
-        "image_caption": caption,
-        "timestamp": assistant_timestamp,
-    })
-    _save_conversation(conversation)
-
-    if is_new_conversation:
-        # Usually a no-op in practice: Chat and Image Model are mutually
-        # exclusive, so llama_cpp.server is normally stopped whenever
-        # this endpoint runs, and _generate_conversation_title bails out
-        # immediately when it is. Still fired for the rare case it isn't
-        # (a mode switch mid-flight) — harmless either way, and the
-        # prompt text itself is already a reasonable fallback title via
-        # list_conversations' plain preview.
-        background_tasks.add_task(
-            _title_background_task, request.project_id, conversation_id, request.prompt
-        )
-
-    return {
-        "conversation_id": conversation_id,
-        "project_id": request.project_id,
-        "image_url": image_url,
-        "caption": caption,
-        "timestamp": assistant_timestamp,
-        "checkpoint": image_manager.current_checkpoint,
-    }
+    return view_resp.content
 
 
 @app.get("/api/image/generated/{project_id}/{filename}")
@@ -953,6 +1039,10 @@ async def swap_model(request: SwapModelRequest):
     to take anywhere from a few seconds to over a minute depending on model
     size, matching the load times you've already benchmarked directly.
     """
+    if remote_client.active():
+        await _remote("POST", "/v1/models/swap", {"model": Path(request.model_path).name})
+        return {"status": "ok", "active_model": request.model_path}
+
     model_path = Path(request.model_path)
     if not model_path.exists() or model_path.suffix != ".gguf":
         raise HTTPException(status_code=400, detail=f"Not a valid .gguf file: {request.model_path}")
@@ -978,6 +1068,12 @@ async def stop_model():
     replacement. Chat requests will fail until a model is started again
     via /api/models/swap or /api/models/restart.
     """
+    if remote_client.active():
+        # The page calls this on its way into Image Model. The server's
+        # own model isn't this device's to stop; /api/image/start asks it
+        # to switch instead.
+        return {"status": "ok", "was_running": False, "stopped_model": None}
+
     async with llama_manager.lock:
         was_running = llama_manager.is_alive()
         stopped_model = llama_manager.current_model_path
@@ -1005,6 +1101,8 @@ async def set_extended_context(request: ExtendedContextRequest):
     explicit so the frontend can prompt for one rather than implying
     the change already happened.
     """
+    if remote_client.active():
+        raise HTTPException(status_code=400, detail="The server you're connected to sets its own context length.")
     llama_manager.extended_context = request.enabled
     return {
         "extended_context": llama_manager.extended_context,
@@ -1020,6 +1118,8 @@ async def restart_model():
     picking a different model — same mechanism as swap, just reusing
     whatever was already active instead of a new path.
     """
+    if remote_client.active():
+        raise HTTPException(status_code=400, detail="The server you're connected to manages its own model.")
     if llama_manager.current_model_path is None:
         raise HTTPException(
             status_code=400,
@@ -1778,7 +1878,7 @@ async def upload_file(
         saved_path.write_bytes(raw_bytes)
 
         try:
-            caption = _caption_image(saved_path)
+            caption = await _caption_for(saved_path)
         except Exception as e:
             print(f"[backend] Image captioning failed for upload {saved_path}: {e}")
             caption = None
@@ -1965,7 +2065,7 @@ async def _generate_conversation_title(first_message: str) -> str | None:
     see _title_background_task — so a slow/failed title generation never
     delays the actual chat response going back to the person waiting on it.
     """
-    if not llama_manager.is_alive():
+    if not llama_manager.is_alive() and not remote_client.active():
         return None
 
     prompt = (
@@ -1974,15 +2074,18 @@ async def _generate_conversation_title(first_message: str) -> str | None:
         "ONLY the title itself, nothing else.\n\n"
         f"Message: {first_message[:500]}"
     )
+    payload = {"messages": [{"role": "user", "content": prompt}], "max_tokens": 20}
     try:
-        async with httpx.AsyncClient(timeout=20.0) as client:
-            response = await client.post(
-                f"{LLAMA_SERVER_URL}/v1/chat/completions",
-                json={"messages": [{"role": "user", "content": prompt}], "max_tokens": 20},
-            )
-            response.raise_for_status()
-            raw_title = response.json()["choices"][0]["message"]["content"]
-    except (httpx.ConnectError, httpx.ReadTimeout, httpx.HTTPStatusError, KeyError, IndexError, ValueError):
+        if remote_client.active():
+            result = await remote_client.call("POST", "/v1/chat/completions", json_body=payload, timeout=60)
+        else:
+            async with httpx.AsyncClient(timeout=20.0) as client:
+                response = await client.post(f"{LLAMA_SERVER_URL}/v1/chat/completions", json=payload)
+                response.raise_for_status()
+                result = response.json()
+        raw_title = result["choices"][0]["message"]["content"]
+    except (httpx.ConnectError, httpx.ReadTimeout, httpx.HTTPStatusError, remote_client.RemoteError,
+            KeyError, IndexError, ValueError):
         return None
 
     # Strip a leading <think>...</think> block the same way real chat
@@ -2043,6 +2146,16 @@ async def _real_token_count(text: str) -> int | None:
     """
     if not text:
         return 0
+    if remote_client.active():
+        try:
+            return (await remote_client.call("POST", "/v1/tokenize/count", json_body={"input": text},
+                                             timeout=30))["count"]
+        except (remote_client.RemoteError, KeyError, TypeError):
+            return None
+    return await _local_token_count(text)
+
+
+async def _local_token_count(text: str) -> int | None:
     try:
         async with httpx.AsyncClient(timeout=30.0) as client:
             r = await client.post(
@@ -2052,6 +2165,33 @@ async def _real_token_count(text: str) -> int | None:
             return r.json()["count"]
     except (httpx.HTTPError, KeyError, ValueError, TypeError):
         return None
+
+
+async def _local_completion(payload: dict, timeout: float = 900.0) -> dict:
+    """One chat-completion call to this computer's own llama_cpp.server —
+    used for this computer's chats and for devices using it in server mode."""
+    try:
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            response = await client.post(f"{LLAMA_SERVER_URL}/v1/chat/completions", json=payload)
+            response.raise_for_status()
+            return response.json()
+    except httpx.ReadTimeout:
+        raise HTTPException(
+            status_code=504,
+            detail="The model is still generating a response after 15 minutes. "
+                    "This can happen with long/complex requests on slower models, "
+                    "especially with reasoning enabled. The generation may still "
+                    "complete on the model server even though this request gave up — "
+                    "check llama_server.log.",
+        )
+    except httpx.ConnectError:
+        raise HTTPException(
+            status_code=503,
+            detail="Cannot reach llama_cpp.server even though the process is alive. "
+                    "It may still be loading the model.",
+        )
+    except httpx.HTTPStatusError as e:
+        raise HTTPException(status_code=502, detail=_friendly_llama_error(e))
 
 
 def _estimate_token_count(text: str) -> int:
@@ -2242,6 +2382,11 @@ FILE_TOOL_INSTRUCTIONS = (
 
 
 async def _ensure_model_running() -> None:
+    if remote_client.active():
+        # Checks the server is reachable and still accepts this device,
+        # and refreshes its context length for _build_model_history.
+        await _remote("GET", "/v1/info", timeout=10)
+        return
     if llama_manager.is_alive():
         return
     # The subprocess died unexpectedly (OOM, crash, reload side-effect —
@@ -2393,7 +2538,9 @@ async def _build_model_history(project_id: str, conversation: dict, perms: dict
     # gracefully instead of hard-failing. Falls back to the original,
     # pre-fix default (2048) only if a model was somehow never started
     # through start() at all, which shouldn't happen in practice.
-    context_length = llama_manager.context_length or 2048
+    # (Using another computer's model, it's that server's context length.)
+    context_length = (remote_client.cached_context_length() if remote_client.active()
+                      else llama_manager.context_length) or 2048
     history_for_model, history_was_trimmed = await _fit_history_to_context(
         history_for_model, context_length
     )
@@ -2426,67 +2573,46 @@ async def _generate(history_for_model: list[dict], context_length: int
     finish_reason = None
     cumulative_usage: dict = {}
 
-    async with httpx.AsyncClient(timeout=900.0) as client:
-        for _round in range(MAX_CONTINUATION_ROUNDS + 1):
-            try:
-                response = await client.post(
-                    f"{LLAMA_SERVER_URL}/v1/chat/completions",
-                    json={"messages": current_messages, "max_tokens": RESPONSE_TOKEN_RESERVE},
-                )
-                response.raise_for_status()
-            except httpx.ReadTimeout:
-                raise HTTPException(
-                    status_code=504,
-                    detail="The model is still generating a response after 15 minutes. "
-                            "This can happen with long/complex requests on slower models, "
-                            "especially with reasoning enabled. The generation may still "
-                            "complete on the model server even though this request gave up — "
-                            "check llama_server.log.",
-                )
-            except httpx.ConnectError:
-                raise HTTPException(
-                    status_code=503,
-                    detail="Cannot reach llama_cpp.server even though the process is alive. "
-                            "It may still be loading the model.",
-                )
-            except httpx.HTTPStatusError as e:
-                raise HTTPException(status_code=502, detail=_friendly_llama_error(e))
+    for _round in range(MAX_CONTINUATION_ROUNDS + 1):
+        payload = {"messages": current_messages, "max_tokens": RESPONSE_TOKEN_RESERVE}
+        if remote_client.active():
+            result = await _remote("POST", "/v1/chat/completions", payload)
+        else:
+            result = await _local_completion(payload)
+        choice = result["choices"][0]
+        piece = choice["message"]["content"]
+        finish_reason = choice.get("finish_reason")
+        assistant_pieces.append(piece)
+        for k, v in result.get("usage", {}).items():
+            if isinstance(v, (int, float)):
+                cumulative_usage[k] = cumulative_usage.get(k, 0) + v
 
-            result = response.json()
-            choice = result["choices"][0]
-            piece = choice["message"]["content"]
-            finish_reason = choice.get("finish_reason")
-            assistant_pieces.append(piece)
-            for k, v in result.get("usage", {}).items():
-                if isinstance(v, (int, float)):
-                    cumulative_usage[k] = cumulative_usage.get(k, 0) + v
+        if finish_reason != "length":
+            break  # the model actually finished on its own — done
 
-            if finish_reason != "length":
-                break  # the model actually finished on its own — done
+        # Don't hand the model (or the final stitched reply) a broken
+        # mid-sentence fragment to build on — cut back to the last
+        # complete sentence first, discarding the incomplete tail, so
+        # the next round starts a clean new sentence instead of being
+        # asked to complete a graft point it may just ignore.
+        kept = _trim_to_last_sentence_boundary(piece)
+        if kept:
+            assistant_pieces[-1] = kept
+        else:
+            kept = piece  # nothing safe to cut — keep the raw piece rather than lose it entirely
 
-            # Don't hand the model (or the final stitched reply) a broken
-            # mid-sentence fragment to build on — cut back to the last
-            # complete sentence first, discarding the incomplete tail, so
-            # the next round starts a clean new sentence instead of being
-            # asked to complete a graft point it may just ignore.
-            kept = _trim_to_last_sentence_boundary(piece)
-            if kept:
-                assistant_pieces[-1] = kept
-            else:
-                kept = piece  # nothing safe to cut — keep the raw piece rather than lose it entirely
-
-            current_messages = current_messages + [
-                {"role": "assistant", "content": kept},
-                {"role": "user", "content": (
-                    "Continue your response with what comes next. Do not "
-                    "repeat anything you already said, and do not add any "
-                    "new preamble or greeting."
-                )},
-            ]
-            # The growing continuation transcript can itself outgrow the
-            # context budget — re-fit before every further call, same as
-            # the original request was.
-            current_messages, _ = await _fit_history_to_context(current_messages, context_length)
+        current_messages = current_messages + [
+            {"role": "assistant", "content": kept},
+            {"role": "user", "content": (
+                "Continue your response with what comes next. Do not "
+                "repeat anything you already said, and do not add any "
+                "new preamble or greeting."
+            )},
+        ]
+        # The growing continuation transcript can itself outgrow the
+        # context budget — re-fit before every further call, same as
+        # the original request was.
+        current_messages, _ = await _fit_history_to_context(current_messages, context_length)
 
     # Plain "".join() glues pieces together with nothing between them —
     # confirmed in testing that a hard max_tokens cutoff can land
@@ -2800,17 +2926,26 @@ async def health():
     server correctly doing the one thing it was asked to do. A ReadTimeout
     here is reported as "busy", not "unreachable".
     """
-    llama_status = "unreachable"
-    if llama_manager.is_alive():
-        async with httpx.AsyncClient(timeout=1.5) as client:
-            try:
-                r = await client.get(f"{LLAMA_SERVER_URL}/v1/models")
-                llama_status = "ok" if r.status_code == 200 else "unreachable"
-            except httpx.ReadTimeout:
-                llama_status = "busy"
-            except httpx.ConnectError:
-                llama_status = "unreachable"
+    network = {"lightweight": LIGHTWEIGHT_MARKER.exists(), "serving": server.running}
+    if remote_client.active():
+        # Using another computer's model: report that server's state.
+        name = (remote_client.state().get("server") or {}).get("name")
+        try:
+            info = await remote_client.info()
+        except remote_client.RemoteError as e:
+            return {"backend": "ok", "llama_cpp_server": "unreachable", "active_model": None,
+                    "extended_context": False, "context_length": None, "loading_elapsed_seconds": None,
+                    "remote": {"name": name, "error": e.detail}, **network}
+        status = info.get("llama_status", "unreachable")
+        if status == "ok" and info.get("waiting"):
+            status = "busy"
+        return {"backend": "ok", "llama_cpp_server": status, "active_model": info.get("model"),
+                "extended_context": False, "context_length": info.get("context_length"),
+                "loading_elapsed_seconds": None,
+                "remote": {"name": info.get("name") or name, "mode": info.get("mode"),
+                           "waiting": info.get("waiting", 0)}, **network}
 
+    llama_status = await _local_llama_status()
     loading_elapsed_seconds = None
     if llama_status != "ok" and llama_manager.load_started_at is not None:
         loading_elapsed_seconds = round(time.time() - llama_manager.load_started_at, 1)
@@ -2822,7 +2957,240 @@ async def health():
         "extended_context": llama_manager.extended_context,
         "context_length": llama_manager.context_length,
         "loading_elapsed_seconds": loading_elapsed_seconds,
+        "remote": None,
+        **network,
     }
+
+
+async def _local_llama_status() -> str:
+    if not llama_manager.is_alive():
+        return "unreachable"
+    async with httpx.AsyncClient(timeout=1.5) as client:
+        try:
+            r = await client.get(f"{LLAMA_SERVER_URL}/v1/models")
+            return "ok" if r.status_code == 200 else "unreachable"
+        except httpx.ReadTimeout:
+            return "busy"
+        except httpx.HTTPError:
+            return "unreachable"
+
+
+# ---- Server mode: this computer's model for other devices on the network ----
+# (server_mode.py is the gateway itself; these hooks are the only model
+# work it can ask this backend to do.)
+
+class _GatewayHooks(server_mode.HostHooks):
+    async def info(self) -> dict:
+        model = Path(llama_manager.current_model_path).name if llama_manager.current_model_path else None
+        models = [{"filename": f.name, "size_gb": round(f.stat().st_size / (1024 ** 3), 2),
+                   "active": f.name == model} for f in sorted(MODELS_DIR.glob("*.gguf"))] if MODELS_DIR.exists() else []
+        checkpoints = [{"filename": f.name, "size_gb": round(f.stat().st_size / (1024 ** 3), 2),
+                        "active": f.name == image_manager.current_checkpoint} for f in _list_checkpoint_files()]
+        return {"model": model, "context_length": llama_manager.context_length,
+                "mode": "image" if image_manager.is_alive() else "chat",
+                "llama_status": await _local_llama_status(), "models": models,
+                "checkpoint": image_manager.current_checkpoint, "checkpoints": checkpoints}
+
+    async def chat(self, payload: dict) -> dict:
+        if not llama_manager.is_alive():
+            raise HTTPException(status_code=409, detail=(
+                "The server's chat model isn't running right now — it may be generating images. "
+                "Try again in a moment."))
+        max_tokens = payload.get("max_tokens")
+        return await _local_completion({
+            "messages": payload["messages"],
+            "max_tokens": max_tokens if isinstance(max_tokens, int) and 0 < max_tokens <= 4096 else RESPONSE_TOKEN_RESERVE,
+        })
+
+    async def tokenize_count(self, text: str) -> int | None:
+        return await _local_token_count(text) if llama_manager.is_alive() else None
+
+    async def generate_image(self, prompt: str):
+        if not image_manager.is_alive():
+            raise HTTPException(status_code=409, detail=(
+                "The server is in chat mode. Turn on Image Model to ask it to switch."))
+        if not image_manager.current_checkpoint:
+            raise HTTPException(status_code=409, detail="The server has no image checkpoint selected.")
+        png = await _comfy_txt2img(prompt)
+        return png, await self.caption(png), image_manager.current_checkpoint
+
+    async def caption(self, image: bytes) -> str | None:
+        try:
+            return await asyncio.to_thread(_caption_bytes, image)
+        except Exception as e:  # noqa: BLE001 — a caption is optional, as everywhere else
+            print(f"[backend] Captioning a device's image failed: {type(e).__name__}")
+            return None
+
+    async def swap_model(self, filename: str) -> None:
+        model_path = MODELS_DIR / Path(filename).name
+        if not filename or model_path.suffix != ".gguf" or not model_path.is_file():
+            raise HTTPException(status_code=400, detail=f"The server has no model called {filename}.")
+        async with image_manager.lock:
+            image_manager.stop()
+        async with llama_manager.lock:
+            llama_manager.start(str(model_path))
+            if not await _wait_for_server_ready():
+                raise HTTPException(status_code=500, detail=f"The server couldn't load {model_path.name}.")
+
+    async def set_mode(self, mode: str) -> None:
+        if mode == "image":
+            async with llama_manager.lock:
+                self._last_chat_model = llama_manager.current_model_path
+                llama_manager.stop()
+            async with image_manager.lock:
+                image_manager.start()
+                if not await _wait_for_comfyui_ready():
+                    raise HTTPException(status_code=500, detail="The server couldn't start image generation.")
+            return
+        async with image_manager.lock:
+            image_manager.stop()
+        model = getattr(self, "_last_chat_model", None) or llama_manager.current_model_path
+        if not model:
+            default = _default_gguf_path()
+            model = str(default) if default else None
+        if not model:
+            raise HTTPException(status_code=500, detail="The server has no chat model to switch back to.")
+        async with llama_manager.lock:
+            llama_manager.start(model)
+            if not await _wait_for_server_ready():
+                raise HTTPException(status_code=500, detail="The server couldn't reload its chat model.")
+
+    async def set_checkpoint(self, filename: str) -> None:
+        if filename not in [f.name for f in _list_checkpoint_files()]:
+            raise HTTPException(status_code=400, detail=f"The server has no checkpoint called {filename}.")
+        image_manager.current_checkpoint = filename
+
+
+server = server_mode.ServerMode()
+server.hooks = _GatewayHooks()
+
+
+@app.get("/api/network")
+def network_status():
+    return {"server": server.status(), "client": remote_client.public_state(),
+            "lightweight": LIGHTWEIGHT_MARKER.exists()}
+
+
+@app.put("/api/network/server")
+async def update_server(body: dict):
+    if body.get("enabled") and remote_client.active():
+        raise HTTPException(status_code=400, detail=(
+            "This computer is using another computer's model. Switch back to its own model before "
+            "sharing it."))
+    try:
+        await server.apply(body)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    return network_status()
+
+
+class PairingAnswer(BaseModel):
+    approve: bool
+
+
+@app.post("/api/network/server/pairing/{request_id}")
+def answer_pairing(request_id: str, answer: PairingAnswer):
+    try:
+        server.answer_pairing(request_id, answer.approve)
+    except KeyError as e:
+        raise HTTPException(status_code=404, detail=str(e.args[0]))
+    return network_status()
+
+
+@app.post("/api/network/server/devices/{device_id}/{action}")
+def manage_device(device_id: str, action: str):
+    """boot (disconnect now; it can ask to pair again), block, unblock or forget."""
+    try:
+        if action == "boot":
+            server.boot(device_id)
+        elif action in ("block", "unblock"):
+            server.block(device_id, action == "block")
+        elif action == "forget":
+            server.forget(device_id)
+        else:
+            raise HTTPException(status_code=400, detail="action must be boot, block, unblock or forget.")
+    except KeyError as e:
+        raise HTTPException(status_code=404, detail=str(e.args[0]))
+    return network_status()
+
+
+@app.get("/api/network/discover")
+async def discover_servers():
+    own = set(server_mode.lan_addresses()) if server.running else set()
+    found = await remote_client.discover()
+    return {"servers": [s for s in found if not (s["host"] in own and s["port"] == server.settings["port"])]}
+
+
+class PairRequest(BaseModel):
+    host: str
+    port: int = server_mode.DEFAULT_PORT
+
+
+@app.post("/api/network/client/pair")
+async def start_pairing(request: PairRequest):
+    if server.running:
+        raise HTTPException(status_code=400, detail="Turn off server mode on this computer first.")
+    try:
+        await remote_client.begin_pairing(request.host, request.port)
+    except remote_client.RemoteError as e:
+        raise HTTPException(status_code=e.status_code, detail=e.detail)
+    return network_status()
+
+
+@app.post("/api/network/client/pair/check")
+async def check_pairing():
+    try:
+        result = await remote_client.check_pairing()
+    except remote_client.RemoteError as e:
+        raise HTTPException(status_code=e.status_code, detail=e.detail)
+    if result["status"] == "approved":
+        await _use_remote(True)
+    return {**network_status(), "pairing_status": result["status"]}
+
+
+@app.post("/api/network/client/pair/cancel")
+def cancel_pairing():
+    remote_client.cancel_pairing()
+    return network_status()
+
+
+class ActiveRequest(BaseModel):
+    active: bool
+
+
+@app.post("/api/network/client/active")
+async def set_remote_active(request: ActiveRequest):
+    try:
+        remote_client.set_active(request.active)
+    except remote_client.RemoteError as e:
+        raise HTTPException(status_code=e.status_code, detail=e.detail)
+    await _use_remote(request.active)
+    return network_status()
+
+
+@app.post("/api/network/client/forget")
+async def forget_server():
+    was_active = remote_client.active()
+    remote_client.forget()
+    if was_active:
+        await _use_remote(False)
+    return network_status()
+
+
+async def _use_remote(on: bool) -> None:
+    """Switching to another computer's model frees this one's GPU; switching
+    back loads this computer's default model again (in the background)."""
+    if on:
+        async with llama_manager.lock:
+            llama_manager.stop()
+        async with image_manager.lock:
+            image_manager.stop()
+        with contextlib.suppress(remote_client.RemoteError):
+            await remote_client.info()
+        return
+    default = _default_gguf_path()
+    if default and not llama_manager.is_alive():
+        llama_manager.start(str(default))
 
 
 @app.post("/api/shutdown")

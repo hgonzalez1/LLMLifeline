@@ -34,6 +34,14 @@ generated_images/
 # — this machine's settings, edited from the app's Permissions panel.
 permissions.json
 
+# Network (server mode): this computer's certificate and private key,
+# its approved devices, the server it's paired with (and that server's
+# key for it), and whether it's a lightweight install. All per-machine,
+# and the keys are secrets.
+server/
+remote.json
+lightweight-install.txt
+
 # persona.txt and beliefs/ ARE shipped as real defaults, by request —
 # everything in beliefs/ EXCEPT the NASB translation specifically,
 # which is copyrighted by the Lockman Foundation and not ours to

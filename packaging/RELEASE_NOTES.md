@@ -1,6 +1,18 @@
 A private AI chat and image generator that runs on your own computer. No cloud, no subscription, no account.
 
-**1.1.1** fixes a startup crash in 1.1.0. Its backend wouldn't start when LLMlifeline's Python environment was Python 3.11 or newer, which covers most Macs. If you installed 1.1.0, update to this one the same way as described below.
+## New in 1.2: share one model across your home network
+
+Open **🖧 Network** in the sidebar. One computer, usually the one with the strongest graphics card, shares its model, and your other computers use it. **Every computer keeps its own projects, chats, files and settings.** Only the model's work (writing replies, drawing images, describing photos) happens on the sharing computer.
+
+- **Approve every device.** A device asking to connect shows a 6-digit code, and so does the sharing computer. Approve only if they match. That proves the device is talking to your real computer, not an impostor.
+- **Devices list:** see who's connected now. **Boot** disconnects a device, which can ask to pair again. **Block** refuses it until you unblock it.
+- **Encrypted and local only:** connections are encrypted, and only devices on your home network are answered.
+- **What the sharing computer keeps:** only each device's name and when and from where it was last seen. It holds a request in memory just long enough to answer it, and saves, logs and forwards nothing from it.
+- **Find computers automatically,** or type the address.
+- **Lightweight install:** a computer without a good graphics card can now skip the heavy install. On a fresh setup, LLMlifeline asks where its model will run. "On another computer" means no models, no image tools and no GPU libraries, under 1 GB in total.
+- **Your choice:** whether devices may generate images, and whether they may change the sharing computer's model (off by default, since it affects everyone).
+
+The sharing computer needs to be powerful, or should run a smaller, faster model. Everyone shares one model, so requests take turns. Windows or macOS will ask once whether to allow incoming connections; on Windows, allow private networks only.
 
 ## New in 1.1: computer use
 
@@ -22,9 +34,9 @@ What it can't promise: a program can do anything once it runs. LLMlifeline check
 
 **Also fixed:** any website open in your browser could previously read LLMlifeline's local server, including your conversations. LLMlifeline now answers only its own page on your computer. ComfyUI's online "API nodes" are switched off.
 
-## Updating from 1.0.0 or 1.1.0
+## Updating from an earlier version
 
-Your conversations, persona, beliefs and models are never touched by these updates.
+Your conversations, persona, beliefs and models are never touched by these updates. On its next start, LLMlifeline installs the two small packages server mode needs (`cryptography` and `zeroconf`) by itself.
 
 - **Mac:** open the new `.dmg` and drag **LLMlifeline** into **Applications**. Choose **Replace**. Run the `xattr` command below once more, since it's a new app. Your data in `~/LLMlifeline` stays as it is, and the new code is copied in on first launch.
 - **Windows:** quit LLMlifeline (Stop in the app). Unzip `LLMlifeline-windows-x64-update.zip`, then copy what's inside its `LLMlifeline` folder over your existing LLMlifeline folder, choosing **Replace**.
