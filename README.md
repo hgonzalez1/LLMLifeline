@@ -28,6 +28,13 @@ Type in the box at the bottom and hit **Send**, or Enter. Each message shows the
 
 Check the **Image Model** box at the top to switch modes — this automatically pauses the chat model and starts up the image generator (the two never run at the same time; your hardware only has to do one job at once). Pick a checkpoint from the dropdown if you have more than one, then type a description and hit Send, same as chatting. The image appears right in the conversation, with a real caption describing what was actually drawn. Uncheck the box (or check **Chat Model**) to switch back — your last active chat model picks back up automatically.
 
+### Choosing a chat model
+
+The model dropdown at the top lists every chat model this computer can run, under headings: **GGUF models** (the `.gguf` files LLMlifeline runs itself) and one heading for each installed engine add-on. Pick one, and LLMlifeline stops the current model and loads that one. Your projects, conversations and settings stay as they are. The model you used last is loaded again the next time LLMlifeline starts.
+
+- **Models kept in other folders.** Create `model-folders.txt` in the LLMlifeline folder and put one folder per line, for example a folder of models on a faster drive. The `.gguf` files directly inside those folders join the dropdown. Those folders are searched before `models\`, so if the same file is in both places, the copy from your listed folder is used.
+- **Engine add-ons.** An add-on lets LLMlifeline use models that another program runs, for example a model far too big for your memory that a separate engine streams from disk. Installing one means putting its folder in `addons\`; see [addons/README.md](addons/README.md). Everything else in LLMlifeline works the same with an add-on's models, but some add-on engines are much slower: the status dot shows "Not Ready" while one loads, and a reply can take minutes.
+
 ### Asking the assistant to work with files
 
 Just ask naturally — "create a file called notes.txt with this content," "what does that file say," "delete the old draft." Each project has its own private `files/` workspace, and the assistant genuinely creates, reads, and deletes real files there on request — not simulated, not just describing what it would do. Unless you turn on computer use (below), it's confined to that one project's workspace and can't touch anything else on your computer.
@@ -100,6 +107,8 @@ LLMlifeline is meant to be edited, not just used. Here's what's actually in the 
 | `projects\` | Every project's saved conversations — generated automatically, not for hand-editing |
 | `generated_images\` | Every image ever generated or uploaded, organized by project |
 | `models\` | Chat model files (`.gguf`) |
+| `model-folders.txt` | Optional: more folders with `.gguf` chat models, one per line — see "Choosing a chat model" |
+| `addons\` | Optional engine add-ons that bring their own models — see [addons/README.md](addons/README.md) |
 | `ComfyUI\models\checkpoints\` | Image model files (`.safetensors`) |
 
 ### `persona.txt` — the assistant's personality

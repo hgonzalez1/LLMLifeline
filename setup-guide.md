@@ -93,6 +93,13 @@ LLMlifeline\ComfyUI\models\checkpoints\
 ```
 Both folders already have a `put_checkpoints_here`-style placeholder marking where they go. Chat models appear in the model dropdown; checkpoints appear in the Image Model checkpoint dropdown — both refresh automatically, no restart needed.
 
+Chat models can also stay where they already are. List their folders in `LLMlifeline\model-folders.txt`, one per line (lines starting with `#` are comments):
+```
+# a folder of .gguf models on my SSD
+S:\AI Models\GGUF
+```
+Listed folders are searched before `models\`, and a file that's in both places appears once, from the listed folder. For models run by another program, install an engine add-on into `LLMlifeline\addons\` (see `addons\README.md`) and restart LLMlifeline; its models get their own heading in the dropdown.
+
 Anything beyond the automatic defaults is never bundled or downloaded for you — model files run tens of gigabytes each, so adding more is always a manual, deliberate step.
 
 ### Step 4 — Confirm it's running
@@ -100,7 +107,7 @@ Anything beyond the automatic defaults is never bundled or downloaded for you �
 `start.bat` opens your browser automatically once the backend is ready — the app is served directly from the backend now, at `http://127.0.0.1:8001/`, so there's no separate `frontend\index.html` file to open by hand anymore. If it doesn't open on its own, go to that URL yourself. You should see:
 - A status dot with text next to it — "Ready" (green), "Busy" (yellow), or "Not Ready" (red)
 - A project sidebar
-- A model dropdown showing your `.gguf` files
+- A model dropdown showing your `.gguf` files (and any add-on's models)
 
 ### The `.exe`
 

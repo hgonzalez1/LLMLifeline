@@ -968,15 +968,24 @@ async function loadModels() {
     const select = el("model-select");
     select.innerHTML = "";
     if (data.models.length === 0) {
-      select.innerHTML = "<option>No models found in C:\\models</option>";
+      select.innerHTML = "<option>No models found in the models folder</option>";
       return;
     }
+    // .gguf files first, then each engine add-on's models under its own heading.
+    const groups = new Map();
     data.models.forEach((m) => {
+      const name = m.group || "Models";
+      if (!groups.has(name)) {
+        const group = document.createElement("optgroup");
+        group.label = name;
+        groups.set(name, group);
+        select.appendChild(group);
+      }
       const opt = document.createElement("option");
       opt.value = m.path;
-      opt.textContent = `${m.filename} (${m.size_gb} GB)${m.active ? " — active" : ""}`;
+      opt.textContent = `${m.filename} (${m.size_gb} GB)${m.note ? ` · ${m.note}` : ""}${m.active ? " — active" : ""}`;
       opt.selected = m.active;
-      select.appendChild(opt);
+      groups.get(name).appendChild(opt);
       if (m.active) selectedModel = m.path;
     });
   } catch (e) {

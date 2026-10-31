@@ -42,6 +42,14 @@ server/
 remote.json
 lightweight-install.txt
 
+# Extra model folders, engine add-ons and the chat model last used — what
+# this computer has installed and chose. addons/README.md (how to write
+# one) is the only shipped part of addons/.
+model-folders.txt
+last-chat-model.txt
+addons/*
+!addons/README.md
+
 # persona.txt and beliefs/ ARE shipped as real defaults, by request —
 # everything in beliefs/ EXCEPT the NASB translation specifically,
 # which is copyrighted by the Lockman Foundation and not ours to

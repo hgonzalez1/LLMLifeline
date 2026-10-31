@@ -50,6 +50,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 import computer_use
+import model_sources
 import remote_client
 import server_mode
 
@@ -78,8 +79,7 @@ BELIEFS_CACHE_DIR = APP_ROOT / "beliefs" / "_cache"
 LLAMA_SERVER_HOST = "127.0.0.1"
 LLAMA_SERVER_PORT = 8000
 LLAMA_SERVER_URL = f"http://{LLAMA_SERVER_HOST}:{LLAMA_SERVER_PORT}"
-DEFAULT_MODEL = MODELS_DIR / "Qwen3-30B-A3B-Q4_K_M.gguf"
-LLAMA_SERVER_STARTUP_TIMEOUT = 600  # seconds — cold loads on this hardware have taken up to ~10 min
+DEFAULT_MODEL = MODELS_DIR / "Qwen3-30B-A3B-Q4_K_M.gguf"  # by file name, in any model folder (see model_sources)
 
 PROJECTS_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -287,25 +287,105 @@ def _choose_context_length(model_path: str, doubled: bool = False) -> int:
     return base * 2 if doubled else base
 
 
+def _windows_process_family(root_pid: int) -> list[int]:
+    """root_pid and every process descended from it, from a Toolhelp snapshot."""
+    import ctypes
+    from ctypes import wintypes
+
+    class ProcessEntry(ctypes.Structure):
+        _fields_ = [("dwSize", wintypes.DWORD), ("cntUsage", wintypes.DWORD), ("th32ProcessID", wintypes.DWORD),
+                    ("th32DefaultHeapID", ctypes.c_size_t), ("th32ModuleID", wintypes.DWORD),
+                    ("cntThreads", wintypes.DWORD), ("th32ParentProcessID", wintypes.DWORD),
+                    ("pcPriClassBase", ctypes.c_long), ("dwFlags", wintypes.DWORD), ("szExeFile", ctypes.c_wchar * 260)]
+
+    kernel32 = ctypes.windll.kernel32
+    kernel32.CreateToolhelp32Snapshot.restype = ctypes.c_void_p
+    snapshot = kernel32.CreateToolhelp32Snapshot(0x2, 0)  # TH32CS_SNAPPROCESS
+    if snapshot in (None, ctypes.c_void_p(-1).value):
+        return [root_pid]
+    children: dict[int, list[int]] = {}
+    try:
+        entry = ProcessEntry()
+        entry.dwSize = ctypes.sizeof(ProcessEntry)
+        more = kernel32.Process32FirstW(ctypes.c_void_p(snapshot), ctypes.byref(entry))
+        while more:
+            children.setdefault(entry.th32ParentProcessID, []).append(entry.th32ProcessID)
+            more = kernel32.Process32NextW(ctypes.c_void_p(snapshot), ctypes.byref(entry))
+    finally:
+        kernel32.CloseHandle(ctypes.c_void_p(snapshot))
+    family, queue = [], [root_pid]
+    while queue:
+        pid = queue.pop()
+        if pid not in family:
+            family.append(pid)
+            queue.extend(children.get(pid, []))
+    return family
+
+
+def _wait_for_windows_exit(pids: list[int], timeout: float) -> None:
+    import ctypes
+    kernel32 = ctypes.windll.kernel32
+    kernel32.OpenProcess.restype = ctypes.c_void_p
+    deadline = time.time() + timeout
+    for pid in pids:
+        handle = kernel32.OpenProcess(0x00100000, False, pid)  # SYNCHRONIZE; None once it's gone
+        if handle:
+            kernel32.WaitForSingleObject(ctypes.c_void_p(handle), max(0, int((deadline - time.time()) * 1000)))
+            kernel32.CloseHandle(ctypes.c_void_p(handle))
+
+
+def _stop_process_tree(process: subprocess.Popen, timeout: float = 30) -> None:
+    """Stop a server process and everything it started, and wait until
+    they have all exited. An add-on's engine is often a launcher whose
+    real work runs in a child process; stopping only the parent would
+    leave that child holding the RAM and GPU, and a child that is still
+    exiting would make the next model see less free VRAM than it will
+    have."""
+    if sys.platform == "win32":
+        family = _windows_process_family(process.pid)
+        subprocess.run(["taskkill", "/PID", str(process.pid), "/T", "/F"],
+                       capture_output=True, timeout=30)
+        _wait_for_windows_exit(family, timeout)
+    else:
+        process.terminate()
+    try:
+        process.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        process.kill()
+        process.wait()
+
+
 class LlamaServerManager:
     """
-    Owns the llama_cpp.server subprocess. Only one instance of the server
-    runs at a time — swapping models means terminating the current process
-    and launching a new one pointed at a different .gguf file.
+    Owns the chat model's server subprocess: llama_cpp.server for a .gguf
+    file, or the program an engine add-on names for one of its models (see
+    model_sources.py). Either way it answers OpenAI-style requests on
+    LLAMA_SERVER_PORT, so everything that talks to it is the same. Only
+    one runs at a time — swapping models means terminating the current
+    process and launching the next one.
     """
 
     def __init__(self):
         self.process: subprocess.Popen | None = None
-        self.current_model_path: str | None = None
+        self.current_model_path: str | None = None  # a .gguf path or an "addon:..." model reference
         self.lock = asyncio.Lock()  # prevents overlapping swap attempts
         self.log_path = APP_ROOT / "llama_server.log"
         self.log_file = None
         self.extended_context = False  # toggle: doubles the auto-selected context length
         self.load_started_at: float | None = None  # time.time() when the current/last load began
         self.context_length: int | None = None  # the real n_ctx the running server was launched with — set in start(), used by /api/chat to budget history against instead of guessing
+        self._use_settings(model_sources.LAUNCH_DEFAULTS)
+
+    def _use_settings(self, spec: dict) -> None:
+        self.ready_path = spec["ready_path"]
+        self.tokenize_path = spec["tokenize_path"]
+        self.startup_timeout = spec["startup_timeout"]
+        self.request_timeout = spec["request_timeout"]
+        self.model_titles = spec["model_titles"]
+        self.request_options = dict(spec["request_options"])
 
     def start(self, model_path: str):
-        """Launch llama_cpp.server as a subprocess pointed at model_path.
+        """Launch the server for model_path (a .gguf file or an add-on model).
 
         Writes output to a log file rather than a PIPE — piping subprocess
         stdout on Windows under uvicorn/multiprocessing has known handle-
@@ -316,12 +396,35 @@ class LlamaServerManager:
         if self.process is not None:
             self.stop()
 
+        # Raises AddonError before anything is stopped or launched if the
+        # add-on can't start this model.
+        spec = (model_sources.launch_spec(model_path, LLAMA_SERVER_PORT)
+                if model_sources.is_addon_model(model_path) else None)
+
         self.log_path.parent.mkdir(parents=True, exist_ok=True)
         self.log_file = open(self.log_path, "w", encoding="utf-8")
+        self.load_started_at = time.time()
 
+        if spec is not None:
+            self._use_settings(spec)
+            self.context_length = spec["context_length"]
+            self.process = subprocess.Popen(
+                spec["args"],
+                cwd=spec["cwd"],
+                env={**os.environ, **spec["env"]},
+                stdout=self.log_file,
+                stderr=subprocess.STDOUT,
+                creationflags=subprocess.CREATE_NEW_PROCESS_GROUP if sys.platform == "win32" else 0,
+            )
+            self.current_model_path = model_path
+            model_sources.remember_model(model_path)
+            print(f"[backend] Launched add-on model {model_sources.display_name(model_path)} "
+                  f"(PID {self.process.pid}), context={self.context_length}, output -> {self.log_path}")
+            return
+
+        self._use_settings({**model_sources.LAUNCH_DEFAULTS, "tokenize_path": "/extras/tokenize/count"})
         chosen_context = _choose_context_length(model_path, doubled=self.extended_context)
         self.context_length = chosen_context
-        self.load_started_at = time.time()
         self.process = subprocess.Popen(
             [
                 sys.executable, "-m", "llama_cpp.server",
@@ -336,21 +439,17 @@ class LlamaServerManager:
             creationflags=subprocess.CREATE_NEW_PROCESS_GROUP if sys.platform == "win32" else 0,
         )
         self.current_model_path = model_path
+        model_sources.remember_model(model_path)
         extended_note = " (extended context ON)" if self.extended_context else ""
         print(f"[backend] Launched llama_cpp.server (PID {self.process.pid}), "
               f"context={chosen_context}{extended_note} (auto-selected based on detected VRAM), "
               f"output -> {self.log_path}")
 
     def stop(self):
-        """Terminate the current llama_cpp.server process, if any."""
+        """Terminate the current model server and its child processes, if any."""
         if self.process is None:
             return
-        self.process.terminate()
-        try:
-            self.process.wait(timeout=15)
-        except subprocess.TimeoutExpired:
-            self.process.kill()
-            self.process.wait()
+        _stop_process_tree(self.process)
         self.process = None
         if self.log_file is not None:
             self.log_file.close()
@@ -450,10 +549,12 @@ class ImageServerManager:
 image_manager = ImageServerManager()
 
 
-async def _wait_for_server_ready(timeout: int = LLAMA_SERVER_STARTUP_TIMEOUT) -> bool:
-    """Poll llama_cpp.server's /v1/models until it responds or we time out.
-    Loading a multi-gigabyte model takes real time — this replaces a fixed
-    sleep with an actual readiness check."""
+async def _wait_for_server_ready(timeout: int | None = None) -> bool:
+    """Poll the model server's readiness path (llama_cpp.server's
+    /v1/models, or whatever an add-on named) until it responds or we time
+    out. Loading a multi-gigabyte model takes real time — this replaces a
+    fixed sleep with an actual readiness check."""
+    timeout = timeout or llama_manager.startup_timeout
     await asyncio.sleep(2)  # give the OS a moment to actually spawn the process
     if not llama_manager.is_alive():
         print(f"[backend] llama_cpp.server exited immediately after launch. "
@@ -469,13 +570,13 @@ async def _wait_for_server_ready(timeout: int = LLAMA_SERVER_STARTUP_TIMEOUT) ->
                       f"Check {llama_manager.log_path} for details.")
                 return False
             try:
-                r = await client.get(f"{LLAMA_SERVER_URL}/v1/models")
+                r = await client.get(f"{LLAMA_SERVER_URL}{llama_manager.ready_path}")
                 if r.status_code == 200:
                     return True
             except (httpx.ConnectError, httpx.ConnectTimeout, httpx.ReadTimeout):
                 pass  # not ready yet — keep polling until the outer deadline
             await asyncio.sleep(1)
-    print(f"[backend] Timed out after {timeout}s waiting for llama_cpp.server to become ready.")
+    print(f"[backend] Timed out after {timeout}s waiting for the model server to become ready.")
     return False
 
 
@@ -516,14 +617,24 @@ async def _wait_for_comfyui_ready(timeout: int = 300) -> bool:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Startup: launch llama_cpp.server with a default model, so Chat
-    # Model (the default-checked mode in the UI) is actually usable the
-    # moment the backend comes up, not just after a manual dropdown pick.
-    # (Not when this computer uses another computer's model instead.)
-    default_model = _default_gguf_path()
+    # Startup: launch the chat model used last (or a default one), so
+    # Chat Model (the default-checked mode in the UI) is actually usable
+    # the moment the backend comes up, not just after a manual dropdown
+    # pick. (Not when this computer uses another computer's model instead.)
+    # An add-on's engine can take minutes to load, longer than the
+    # launcher waits for this backend, so the page opens meanwhile and
+    # shows it loading.
+    default_model = _default_chat_model()
     if default_model and not remote_client.active():
-        llama_manager.start(str(default_model))
-        await _wait_for_server_ready()
+        try:
+            llama_manager.start(default_model)
+        except model_sources.AddonError as e:
+            print(f"[backend] {e}")
+        else:
+            if model_sources.is_addon_model(default_model):
+                app.state.model_loading = asyncio.create_task(_wait_for_server_ready())
+            else:
+                await _wait_for_server_ready()
 
     # Also pre-select a default image checkpoint — WITHOUT starting
     # ComfyUI itself, since Chat Model is the default active mode and
@@ -607,21 +718,23 @@ class GenerateImageRequest(BaseModel):
 COMFYUI_CHECKPOINT_EXTENSIONS = (".safetensors", ".ckpt", ".pt", ".bin")
 
 
-def _default_gguf_path() -> Path | None:
+def _default_chat_model() -> str | None:
     """
-    Pick the chat model to auto-launch at startup: DEFAULT_MODEL if that
-    exact file actually exists, else the first .gguf found in
-    MODELS_DIR (sorted, so it's deterministic). Falling back matters —
-    DEFAULT_MODEL is a fixed filename that won't exist on every setup,
-    and silently launching nothing left Chat Model unusable until a
-    person manually picked something from the dropdown.
+    Pick the chat model to auto-launch: the one last started on this
+    computer if it can still run, else DEFAULT_MODEL's file in any model
+    folder, else the first .gguf found (sorted, so it's deterministic).
+    Falling back matters — DEFAULT_MODEL is a fixed filename that won't
+    exist on every setup, and silently launching nothing left Chat Model
+    unusable until a person manually picked something from the dropdown.
     """
-    if DEFAULT_MODEL.exists():
-        return DEFAULT_MODEL
-    if not MODELS_DIR.exists():
-        return None
-    gguf_files = sorted(MODELS_DIR.glob("*.gguf"))
-    return gguf_files[0] if gguf_files else None
+    remembered = model_sources.remembered_model()
+    if remembered:
+        return remembered
+    gguf_files = model_sources.gguf_files()
+    for f in gguf_files:
+        if f.name == DEFAULT_MODEL.name:
+            return str(f)
+    return str(gguf_files[0]) if gguf_files else None
 
 
 def _list_checkpoint_files() -> list[Path]:
@@ -646,29 +759,21 @@ async def _remote(method: str, path: str, body: dict | None = None, timeout: flo
 
 @app.get("/api/models")
 async def list_models():
-    """Return every .gguf file in the models folder, flagging which one is
-    currently loaded — or, when using another computer's model, that
-    computer's list (each entry's "path" is then its filename there)."""
+    """Return every chat model this computer can run — .gguf files from the
+    models folder and model-folders.txt, then engine add-ons' models (see
+    model_sources.py) — flagging which one is currently loaded. When using
+    another computer's model, that computer's list instead (each entry's
+    "path" is then its name there)."""
     if remote_client.active():
         info = await _remote("GET", "/v1/info", timeout=10)
         return {"models": [{"filename": m["filename"], "path": m["filename"], "size_gb": m["size_gb"],
-                            "active": m["active"]} for m in info.get("models", [])],
+                            "group": m.get("group"), "active": m["active"]} for m in info.get("models", [])],
                 "remote": True}
     if not MODELS_DIR.exists():
         MODELS_DIR.mkdir(parents=True, exist_ok=True)  # a lightweight install starts without one
 
-    gguf_files = sorted(MODELS_DIR.glob("*.gguf"))
-    return {
-        "models": [
-            {
-                "filename": f.name,
-                "path": str(f),
-                "size_gb": round(f.stat().st_size / (1024 ** 3), 2),
-                "active": str(f) == llama_manager.current_model_path,
-            }
-            for f in gguf_files
-        ]
-    }
+    models = await asyncio.to_thread(model_sources.chat_models, llama_manager.current_model_path)
+    return {"models": models}
 
 
 @app.post("/api/image/start")
@@ -1040,25 +1145,33 @@ async def swap_model(request: SwapModelRequest):
     size, matching the load times you've already benchmarked directly.
     """
     if remote_client.active():
-        await _remote("POST", "/v1/models/swap", {"model": Path(request.model_path).name})
+        await _remote("POST", "/v1/models/swap", {"model": request.model_path})
         return {"status": "ok", "active_model": request.model_path}
 
-    model_path = Path(request.model_path)
-    if not model_path.exists() or model_path.suffix != ".gguf":
-        raise HTTPException(status_code=400, detail=f"Not a valid .gguf file: {request.model_path}")
+    if model_sources.is_addon_model(request.model_path):
+        if not await asyncio.to_thread(model_sources.find_addon_model, request.model_path):
+            raise HTTPException(status_code=400, detail=f"No installed add-on offers {request.model_path}.")
+    else:
+        model_path = Path(request.model_path)
+        if not model_path.exists() or model_path.suffix != ".gguf":
+            raise HTTPException(status_code=400, detail=f"Not a valid .gguf file: {request.model_path}")
+    name = model_sources.display_name(request.model_path)
 
     async with llama_manager.lock:
-        llama_manager.start(str(model_path))
+        try:
+            llama_manager.start(request.model_path)
+        except model_sources.AddonError as e:
+            raise HTTPException(status_code=500, detail=str(e))
         ready = await _wait_for_server_ready()
 
     if not ready:
         raise HTTPException(
             status_code=500,
-            detail=f"Model server did not become ready within {LLAMA_SERVER_STARTUP_TIMEOUT}s "
-                    f"after swapping to {model_path.name}. Check backend console output for errors.",
+            detail=f"Model server did not become ready within {llama_manager.startup_timeout}s "
+                    f"after swapping to {name}. Check {llama_manager.log_path} for errors.",
         )
 
-    return {"status": "ok", "active_model": str(model_path)}
+    return {"status": "ok", "active_model": request.model_path}
 
 
 @app.post("/api/models/stop")
@@ -1128,14 +1241,17 @@ async def restart_model():
 
     model_path = llama_manager.current_model_path
     async with llama_manager.lock:
-        llama_manager.start(model_path)
+        try:
+            llama_manager.start(model_path)
+        except model_sources.AddonError as e:
+            raise HTTPException(status_code=500, detail=str(e))
         ready = await _wait_for_server_ready()
 
     if not ready:
         raise HTTPException(
             status_code=500,
-            detail=f"Restart of {Path(model_path).name} did not become ready within "
-                    f"{LLAMA_SERVER_STARTUP_TIMEOUT}s. Check {llama_manager.log_path} for details.",
+            detail=f"Restart of {model_sources.display_name(model_path)} did not become ready within "
+                    f"{llama_manager.startup_timeout}s. Check {llama_manager.log_path} for details.",
         )
 
     return {"status": "ok", "active_model": model_path}
@@ -2065,8 +2181,8 @@ async def _generate_conversation_title(first_message: str) -> str | None:
     see _title_background_task — so a slow/failed title generation never
     delays the actual chat response going back to the person waiting on it.
     """
-    if not llama_manager.is_alive() and not remote_client.active():
-        return None
+    if not remote_client.active() and (not llama_manager.is_alive() or not llama_manager.model_titles):
+        return None  # a slow add-on engine would make the next message wait for the title
 
     prompt = (
         "Summarize the topic of the following message in 4-6 words, "
@@ -2080,7 +2196,8 @@ async def _generate_conversation_title(first_message: str) -> str | None:
             result = await remote_client.call("POST", "/v1/chat/completions", json_body=payload, timeout=60)
         else:
             async with httpx.AsyncClient(timeout=20.0) as client:
-                response = await client.post(f"{LLAMA_SERVER_URL}/v1/chat/completions", json=payload)
+                response = await client.post(f"{LLAMA_SERVER_URL}/v1/chat/completions",
+                                             json={**llama_manager.request_options, **payload})
                 response.raise_for_status()
                 result = response.json()
         raw_title = result["choices"][0]["message"]["content"]
@@ -2156,10 +2273,12 @@ async def _real_token_count(text: str) -> int | None:
 
 
 async def _local_token_count(text: str) -> int | None:
+    if not llama_manager.tokenize_path:
+        return None  # an add-on engine without a tokenizer endpoint — estimate instead
     try:
         async with httpx.AsyncClient(timeout=30.0) as client:
             r = await client.post(
-                f"{LLAMA_SERVER_URL}/extras/tokenize/count", json={"input": text}
+                f"{LLAMA_SERVER_URL}{llama_manager.tokenize_path}", json={"input": text}
             )
             r.raise_for_status()
             return r.json()["count"]
@@ -2167,9 +2286,13 @@ async def _local_token_count(text: str) -> int | None:
         return None
 
 
-async def _local_completion(payload: dict, timeout: float = 900.0) -> dict:
-    """One chat-completion call to this computer's own llama_cpp.server —
-    used for this computer's chats and for devices using it in server mode."""
+async def _local_completion(payload: dict, timeout: float | None = None) -> dict:
+    """One chat-completion call to this computer's own model server —
+    used for this computer's chats and for devices using it in server mode.
+    Waits as long as the running engine allows (15 minutes for
+    llama_cpp.server; an add-on can allow more for a slower engine)."""
+    timeout = timeout or llama_manager.request_timeout
+    payload = {**llama_manager.request_options, **payload}  # the engine's defaults; the request's own fields win
     try:
         async with httpx.AsyncClient(timeout=timeout) as client:
             response = await client.post(f"{LLAMA_SERVER_URL}/v1/chat/completions", json=payload)
@@ -2178,7 +2301,7 @@ async def _local_completion(payload: dict, timeout: float = 900.0) -> dict:
     except httpx.ReadTimeout:
         raise HTTPException(
             status_code=504,
-            detail="The model is still generating a response after 15 minutes. "
+            detail=f"The model is still generating a response after {round(timeout / 60)} minutes. "
                     "This can happen with long/complex requests on slower models, "
                     "especially with reasoning enabled. The generation may still "
                     "complete on the model server even though this request gave up — "
@@ -2403,13 +2526,16 @@ async def _ensure_model_running() -> None:
           f"attempting automatic relaunch of {llama_manager.current_model_path}")
     async with llama_manager.lock:
         if not llama_manager.is_alive():  # re-check inside the lock — another request may have already fixed this
-            llama_manager.start(llama_manager.current_model_path)
-            recovered = await _wait_for_server_ready()
+            try:
+                llama_manager.start(llama_manager.current_model_path)
+                recovered = await _wait_for_server_ready()
+            except model_sources.AddonError:
+                recovered = False
             if not recovered:
                 raise HTTPException(
                     status_code=503,
                     detail=f"Model process died and automatic relaunch of "
-                            f"{Path(llama_manager.current_model_path).name} failed. "
+                            f"{model_sources.display_name(llama_manager.current_model_path)} failed. "
                             f"Check {llama_manager.log_path} or try swapping models manually.",
                 )
     print("[backend] Automatic relaunch succeeded, proceeding with chat request.")
@@ -2967,7 +3093,7 @@ async def _local_llama_status() -> str:
         return "unreachable"
     async with httpx.AsyncClient(timeout=1.5) as client:
         try:
-            r = await client.get(f"{LLAMA_SERVER_URL}/v1/models")
+            r = await client.get(f"{LLAMA_SERVER_URL}{llama_manager.ready_path}")
             return "ok" if r.status_code == 200 else "unreachable"
         except httpx.ReadTimeout:
             return "busy"
@@ -2981,9 +3107,9 @@ async def _local_llama_status() -> str:
 
 class _GatewayHooks(server_mode.HostHooks):
     async def info(self) -> dict:
-        model = Path(llama_manager.current_model_path).name if llama_manager.current_model_path else None
-        models = [{"filename": f.name, "size_gb": round(f.stat().st_size / (1024 ** 3), 2),
-                   "active": f.name == model} for f in sorted(MODELS_DIR.glob("*.gguf"))] if MODELS_DIR.exists() else []
+        model = model_sources.display_name(llama_manager.current_model_path)
+        models = [{"filename": m["filename"], "size_gb": m["size_gb"], "group": m["group"], "active": m["active"]}
+                  for m in await asyncio.to_thread(model_sources.chat_models, llama_manager.current_model_path)]
         checkpoints = [{"filename": f.name, "size_gb": round(f.stat().st_size / (1024 ** 3), 2),
                         "active": f.name == image_manager.current_checkpoint} for f in _list_checkpoint_files()]
         return {"model": model, "context_length": llama_manager.context_length,
@@ -3022,15 +3148,20 @@ class _GatewayHooks(server_mode.HostHooks):
             return None
 
     async def swap_model(self, filename: str) -> None:
-        model_path = MODELS_DIR / Path(filename).name
-        if not filename or model_path.suffix != ".gguf" or not model_path.is_file():
+        # Devices choose by the name info() listed: a .gguf file name or an add-on model's name.
+        models = await asyncio.to_thread(model_sources.chat_models, llama_manager.current_model_path)
+        chosen = next((m for m in models if filename and m["filename"] == filename), None)
+        if chosen is None:
             raise HTTPException(status_code=400, detail=f"The server has no model called {filename}.")
         async with image_manager.lock:
             image_manager.stop()
         async with llama_manager.lock:
-            llama_manager.start(str(model_path))
+            try:
+                llama_manager.start(chosen["path"])
+            except model_sources.AddonError as e:
+                raise HTTPException(status_code=500, detail=str(e))
             if not await _wait_for_server_ready():
-                raise HTTPException(status_code=500, detail=f"The server couldn't load {model_path.name}.")
+                raise HTTPException(status_code=500, detail=f"The server couldn't load {filename}.")
 
     async def set_mode(self, mode: str) -> None:
         if mode == "image":
@@ -3044,14 +3175,14 @@ class _GatewayHooks(server_mode.HostHooks):
             return
         async with image_manager.lock:
             image_manager.stop()
-        model = getattr(self, "_last_chat_model", None) or llama_manager.current_model_path
-        if not model:
-            default = _default_gguf_path()
-            model = str(default) if default else None
+        model = getattr(self, "_last_chat_model", None) or llama_manager.current_model_path or _default_chat_model()
         if not model:
             raise HTTPException(status_code=500, detail="The server has no chat model to switch back to.")
         async with llama_manager.lock:
-            llama_manager.start(model)
+            try:
+                llama_manager.start(model)
+            except model_sources.AddonError as e:
+                raise HTTPException(status_code=500, detail=str(e))
             if not await _wait_for_server_ready():
                 raise HTTPException(status_code=500, detail="The server couldn't reload its chat model.")
 
@@ -3188,9 +3319,12 @@ async def _use_remote(on: bool) -> None:
         with contextlib.suppress(remote_client.RemoteError):
             await remote_client.info()
         return
-    default = _default_gguf_path()
+    default = _default_chat_model()
     if default and not llama_manager.is_alive():
-        llama_manager.start(str(default))
+        try:
+            llama_manager.start(default)
+        except model_sources.AddonError as e:
+            print(f"[backend] {e}")
 
 
 @app.post("/api/shutdown")
