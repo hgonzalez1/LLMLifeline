@@ -1,5 +1,9 @@
 A private AI chat and image generator that runs on your own computer. No cloud, no subscription, no account.
 
+## Fixed in 1.3.1
+
+- **Conversation counts in the sidebar are right again.** Each project showed one conversation too many, because a search index saved beside the chats was counted as a chat.
+
 ## New in 1.3: replies as they're written, and more models to choose from
 
 - **Replies appear as they're written,** word by word, so you can start reading right away instead of waiting for the whole answer. A model's reasoning shows in a collapsed **Reasoning** section. With computer use, each step appears as the assistant takes it. A reply still finishes and is saved if you reload or close the page.
