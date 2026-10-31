@@ -77,7 +77,7 @@ write(APP / "addons" / "good" / "addon.py", """
         return {"args": ["engine.exe", "--model", model_id, "--port", port], "cwd": "C:/engine",
                 "env": {"THREADS": 8}, "context_length": 16384, "ready_path": "/health",
                 "request_timeout": 7200, "model_titles": False,
-                "request_options": {"chat_template_kwargs": {"enable_thinking": False}}}
+                "request_options": {"chat_template_kwargs": {"enable_thinking": False}}, "stream": 0}
     """)
 write(APP / "addons" / "broken" / "addon.py", "raise RuntimeError('not today')\n")
 write(APP / "addons" / "incomplete" / "addon.py", "def models():\n    return []\n")
@@ -178,6 +178,7 @@ def test_the_backend_runs_an_addon_model_its_way():
         assert manager.ready_path == "/health" and manager.request_timeout == 7200
         assert manager.model_titles is False and manager.tokenize_path is None
         assert manager.request_options == {"chat_template_kwargs": {"enable_thinking": False}}
+        assert manager.stream is False  # this engine answers in one piece
         assert model_sources.remembered_model() == GOOD
 
         gguf = str(EXTRA / "other.gguf")
@@ -187,7 +188,9 @@ def test_the_backend_runs_an_addon_model_its_way():
         assert args[1:3] == ["-m", "llama_cpp.server"] and gguf in args
         assert manager.ready_path == "/v1/models" and manager.request_timeout == 900
         assert manager.model_titles is True and manager.tokenize_path == "/extras/tokenize/count"
-        assert manager.request_options == {}
+        assert manager.request_options == {} and manager.stream is True
+        # Or a health check arriving mid-reply would end its stream early.
+        assert args[args.index("--interrupt_requests") + 1] == "False"
     finally:
         main.subprocess.Popen, main._stop_process_tree, main._choose_context_length = real
         if manager.log_file is not None:

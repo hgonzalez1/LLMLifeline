@@ -20,7 +20,9 @@ Everything lives inside a **project** — think of it like a folder for one topi
 
 ### Chatting
 
-Type in the box at the bottom and hit **Send**, or Enter. Each message shows the time it was sent. The little colored dot at the top tells you the assistant's status — green means ready, yellow means it's busy answering, red means it's not currently running.
+Type in the box at the bottom and hit **Send**, or Enter. The reply appears as the assistant writes it, word by word, so you can start reading right away; a blinking cursor at its end means more is coming. If the model reasons before answering, its reasoning shows as a collapsed **Reasoning** section you can open. Each message shows the time it was sent. The little colored dot at the top tells you the assistant's status — green means ready, yellow means it's busy answering, red means it's not currently running.
+
+If you reload or close the page while a reply is being written, the reply still finishes and is saved: open the conversation again in a moment to see it.
 
 **Past conversations** — the dropdown in the left sidebar under "Conversations" lists every past conversation in the current project, automatically titled by topic (it takes a few seconds after your first message for the real title to appear — it starts as a placeholder). Pick one to load it back up, complete with its full history. The trash icon next to it deletes the conversation you're currently viewing — this can't be undone. **New Chat** starts a fresh one.
 
@@ -33,7 +35,7 @@ Check the **Image Model** box at the top to switch modes — this automatically 
 The model dropdown at the top lists every chat model this computer can run, under headings: **GGUF models** (the `.gguf` files LLMlifeline runs itself) and one heading for each installed engine add-on. Pick one, and LLMlifeline stops the current model and loads that one. Your projects, conversations and settings stay as they are. The model you used last is loaded again the next time LLMlifeline starts.
 
 - **Models kept in other folders.** Create `model-folders.txt` in the LLMlifeline folder and put one folder per line, for example a folder of models on a faster drive. The `.gguf` files directly inside those folders join the dropdown. Those folders are searched before `models\`, so if the same file is in both places, the copy from your listed folder is used.
-- **Engine add-ons.** An add-on lets LLMlifeline use models that another program runs, for example a model far too big for your memory that a separate engine streams from disk. Installing one means putting its folder in `addons\`; see [addons/README.md](addons/README.md). Everything else in LLMlifeline works the same with an add-on's models, but some add-on engines are much slower: the status dot shows "Not Ready" while one loads, and a reply can take minutes.
+- **Engine add-ons.** An add-on lets LLMlifeline use models that another program runs, for example a model far too big for your memory that a separate engine streams from disk. Installing one means putting its folder in `addons\`; see [addons/README.md](addons/README.md). Everything else in LLMlifeline works the same with an add-on's models, but some add-on engines are much slower: the status dot shows "Not Ready" while one loads, and a reply can take minutes. With a slow engine most of the wait comes before the first word, while the engine reads the conversation; after that the reply appears as it's written.
 
 ### Asking the assistant to work with files
 

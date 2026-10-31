@@ -379,6 +379,14 @@
   }
   #typing-indicator.visible { display: block; }
 
+  /* The reply while it's still being written: replaced by the finished one. */
+  .msg-row.draft .bubble::after {
+    content: "▍";
+    color: var(--muted);
+    animation: draft-cursor 1s steps(2) infinite;
+  }
+  @keyframes draft-cursor { 50% { opacity: 0; } }
+
   #context-trimmed-notice {
     display: none;
     color: #d9a843;
@@ -854,6 +862,45 @@ async function apiDelete(path) {
     throw new Error(`DELETE ${path} failed: ${res.status} — ${detail}`);
   }
   return res.json();
+}
+
+/**
+ * POST to /api/chat or /api/chat/approve with the reply streamed (see
+ * _stream_events in backend/main.py). onEvent gets each piece of text and
+ * each tool step as it happens; resolves with the same result the
+ * unstreamed request returns.
+ */
+async function apiStream(path, body, onEvent) {
+  const res = await fetch(`${API_BASE}${path}`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ ...body, stream: true }),
+  });
+  if (!res.ok) {
+    const detail = await res.text();
+    throw new Error(`POST ${path} failed: ${res.status} — ${detail}`);
+  }
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder();
+  let buffered = "";
+  for (;;) {
+    const { value, done } = await reader.read();
+    if (done) break;
+    buffered += decoder.decode(value, { stream: true });
+    let newline;
+    while ((newline = buffered.indexOf("\n")) >= 0) {
+      const line = buffered.slice(0, newline).trim();
+      buffered = buffered.slice(newline + 1);
+      if (!line) continue;
+      const event = JSON.parse(line);
+      if (event.type === "done") return event;
+      if (event.type === "error") {
+        throw new Error(`POST ${path} failed: ${event.status} — ${JSON.stringify({ detail: event.detail })}`);
+      }
+      onEvent(event);
+    }
+  }
+  throw new Error(`POST ${path} ended before the reply finished. It may still be saved — reopen the conversation in a moment.`);
 }
 
 /** PUT that surfaces FastAPI's own error message ("detail") as-is, for the Permissions panel to show. */
@@ -1489,6 +1536,73 @@ function addMessageBubble(role, content, reasoning, imageUrl, timestamp, kind) {
   row.appendChild(bubble);
   el("chat-scroll").appendChild(row);
   el("chat-scroll").scrollTop = el("chat-scroll").scrollHeight;
+  return row;
+}
+
+/**
+ * The reply while the model is still writing it: one assistant bubble
+ * whose text grows as pieces arrive (redrawn at most once per frame),
+ * removed when the finished reply or a tool step takes its place. The
+ * page only follows the text down if you haven't scrolled up to read.
+ */
+function startDraft() {
+  let row = null;
+  let text = "";
+  let scheduled = false;
+
+  function render() {
+    scheduled = false;
+    if (!row) return;
+    const scroll = el("chat-scroll");
+    const following = scroll.scrollHeight - scroll.scrollTop - scroll.clientHeight < 60;
+    const bubble = row.querySelector(".bubble");
+    const reasoningOpen = bubble.querySelector("details")?.open;
+    bubble.textContent = "";
+    // Still inside a <think> block: show it as reasoning, not as the answer.
+    const thinking = text.startsWith("<think>") && !text.includes("</think>");
+    renderAssistantContent(bubble, thinking ? `${text}</think>` : text, null);
+    if (reasoningOpen) bubble.querySelector("details").open = true;
+    if (following) scroll.scrollTop = scroll.scrollHeight;
+  }
+
+  return {
+    add(piece) {
+      text += piece;
+      if (!row) {
+        row = addMessageBubble("assistant", "", null, null, null);
+        row.classList.add("draft");
+      }
+      if (!scheduled) {
+        scheduled = true;
+        requestAnimationFrame(render);
+      }
+    },
+    clear() {
+      row?.remove();
+      row = null;
+      text = "";
+    },
+    /** Leaves what was written on screen, without the cursor that says more is coming. */
+    stop() {
+      if (row) render();
+      row?.classList.remove("draft");
+      row = null;
+    },
+  };
+}
+
+/** What a streamed chat request shows before its result: the reply as it's written, and each tool step as it's taken. */
+function showStreamEvent(event, draft) {
+  const typing = el("typing-indicator");
+  if (event.type === "text") {
+    draft.add(event.text);
+    typing.textContent = "Writing…";
+  } else if (event.type === "step") {
+    draft.clear(); // the step's own bubble shows that text now
+    const m = event.message;
+    addMessageBubble(m.role, m.content, m.reasoning, null, m.timestamp, m.kind);
+    typing.textContent = "Working…";
+  }
 }
 
 /**
@@ -1525,6 +1639,7 @@ async function sendMessage() {
   const typing = el("typing-indicator");
   typing.textContent = activeMode === "image" ? "Generating image…" : "Generating…";
   typing.classList.add("visible");
+  const draft = startDraft();
 
   try {
     if (activeMode === "image") {
@@ -1540,17 +1655,19 @@ async function sendMessage() {
       addMessageBubble("assistant", caption, null, data.image_url, data.timestamp);
     } else {
       document.querySelectorAll(".approval-card button").forEach((b) => (b.disabled = true)); // a new message skips any open approval
-      const data = await apiPost("/api/chat", {
+      const data = await apiStream("/api/chat", {
         project_id: currentProjectId,
         conversation_id: currentConversationId,
         messages: [{ role: "user", content: text }],
-      });
-      showAgentResponse(data);
+      }, (event) => showStreamEvent(event, draft));
+      draft.clear();
+      showAgentResponse(data, true);
     }
     await loadProjects(); // conversation count changed
     await loadConversations(currentProjectId, currentConversationId); // new/updated conversation in the picker
     if (activeMode === "image") await loadProjectImages(currentProjectId); // new generated image
   } catch (e) {
+    draft.stop(); // what was written before the failure stays above the error, though it isn't saved
     addMessageBubble("assistant", `[Error] ${e.message}`);
   } finally {
     el("send-btn").disabled = false;
@@ -1561,10 +1678,12 @@ async function sendMessage() {
 
 // ---------- Computer use: steps and approvals ----------
 
-/** Renders one /api/chat or /api/chat/approve result: the tool steps it took, then its reply or an approval card. */
-function showAgentResponse(data) {
+/** Renders one /api/chat or /api/chat/approve result: the tool steps it took (unless they were already streamed), then its reply or an approval card. */
+function showAgentResponse(data, stepsShown = false) {
   currentConversationId = data.conversation_id;
-  (data.steps || []).forEach((m) => addMessageBubble(m.role, m.content, m.reasoning, null, m.timestamp, m.kind));
+  if (!stepsShown) {
+    (data.steps || []).forEach((m) => addMessageBubble(m.role, m.content, m.reasoning, null, m.timestamp, m.kind));
+  }
   if (data.reply !== null && data.reply !== undefined) {
     addMessageBubble("assistant", data.reply, data.reasoning, null, data.timestamp);
   }
@@ -1620,17 +1739,20 @@ async function answerApproval(actionId, decision, card, answer, label) {
   typing.textContent = decision === "deny" ? "Continuing…" : "Working…";
   typing.classList.add("visible");
   el("send-btn").disabled = true;
+  const draft = startDraft();
   try {
-    const data = await apiPost("/api/chat/approve", {
+    const data = await apiStream("/api/chat/approve", {
       project_id: currentProjectId,
       conversation_id: currentConversationId,
       action_id: actionId,
       decision,
-    });
-    showAgentResponse(data);
+    }, (event) => showStreamEvent(event, draft));
+    draft.clear();
+    showAgentResponse(data, true);
     if (decision === "always") refreshPermissionsState();
     await loadConversations(currentProjectId, currentConversationId);
   } catch (e) {
+    draft.stop();
     addMessageBubble("assistant", `[Error] ${e.message}`);
   } finally {
     el("send-btn").disabled = false;

@@ -36,6 +36,7 @@ import re
 import subprocess
 import sys
 import time
+import traceback
 import uuid
 import contextlib
 from contextlib import asynccontextmanager
@@ -45,7 +46,7 @@ from urllib.parse import urlsplit
 
 import httpx
 from fastapi import BackgroundTasks, FastAPI, File, Form, HTTPException, Request, UploadFile
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
@@ -383,6 +384,7 @@ class LlamaServerManager:
         self.request_timeout = spec["request_timeout"]
         self.model_titles = spec["model_titles"]
         self.request_options = dict(spec["request_options"])
+        self.stream = spec["stream"]
 
     def start(self, model_path: str):
         """Launch the server for model_path (a .gguf file or an add-on model).
@@ -433,6 +435,10 @@ class LlamaServerManager:
                 "--n_ctx", str(chosen_context),
                 "--host", LLAMA_SERVER_HOST,
                 "--port", str(LLAMA_SERVER_PORT),
+                # By default llama_cpp.server ends a streamed reply early, with
+                # no finish_reason, whenever another request arrives — and the
+                # page's health check (/v1/models) arrives every few seconds.
+                "--interrupt_requests", "False",
             ],
             stdout=self.log_file,
             stderr=subprocess.STDOUT,
@@ -695,6 +701,7 @@ class ChatRequest(BaseModel):
     project_id: str
     conversation_id: str | None = None
     messages: list[ChatMessage]
+    stream: bool = False  # True: the reply arrives as it's written (see _stream_events)
 
 
 class CreateProjectRequest(BaseModel):
@@ -748,11 +755,12 @@ def _list_checkpoint_files() -> list[Path]:
 
 # ---- Models folder scanning ----
 
-async def _remote(method: str, path: str, body: dict | None = None, timeout: float = 900.0) -> dict:
+async def _remote(method: str, path: str, body: dict | None = None, timeout: float = 900.0,
+                  on_text=None) -> dict:
     """Calls the paired server (see remote_client), turning its errors into
     ones the page can show."""
     try:
-        return await remote_client.call(method, path, json_body=body, timeout=timeout)
+        return await remote_client.call(method, path, json_body=body, timeout=timeout, on_text=on_text)
     except remote_client.RemoteError as e:
         raise HTTPException(status_code=e.status_code, detail=e.detail)
 
@@ -2298,8 +2306,69 @@ async def _local_completion(payload: dict, timeout: float | None = None) -> dict
             response = await client.post(f"{LLAMA_SERVER_URL}/v1/chat/completions", json=payload)
             response.raise_for_status()
             return response.json()
-    except httpx.ReadTimeout:
-        raise HTTPException(
+    except httpx.HTTPError as e:
+        raise _llama_http_error(e, timeout)
+
+
+async def _local_completion_stream(payload: dict, on_text, timeout: float | None = None) -> dict:
+    """
+    _local_completion, with each piece of the reply handed to on_text as
+    the model writes it. Returns the same shape, so everything after it
+    (continuations, <think> stripping, action blocks) works unchanged.
+    The timeout is per piece here: how long the model may go quiet, which
+    for a slow engine is mostly reading the prompt before the first word.
+    An engine that answers in one piece instead (it ignored "stream") is
+    accepted as it is.
+    """
+    timeout = timeout or llama_manager.request_timeout
+    payload = {**llama_manager.request_options, **payload, "stream": True,
+               "stream_options": {"include_usage": True}}
+    pieces: list[str] = []
+    finish_reason, usage = None, {}
+    try:
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            async with client.stream("POST", f"{LLAMA_SERVER_URL}/v1/chat/completions", json=payload) as response:
+                if response.status_code >= 400:
+                    await response.aread()
+                    response.raise_for_status()
+                if not response.headers.get("content-type", "").startswith("text/event-stream"):
+                    await response.aread()
+                    return response.json()
+                async for line in response.aiter_lines():
+                    if not line.startswith("data:"):
+                        continue  # blank separators, SSE comments and keep-alive pings
+                    data = line[5:].strip()
+                    if data == "[DONE]":
+                        break
+                    chunk = json.loads(data)
+                    if chunk.get("error"):
+                        error = chunk["error"]
+                        raise HTTPException(status_code=502, detail=(
+                            "The AI model reported an error and couldn't finish this response. "
+                            f"({error.get('message', error) if isinstance(error, dict) else error})"))
+                    usage = chunk.get("usage") or usage
+                    for choice in chunk.get("choices") or []:
+                        finish_reason = choice.get("finish_reason") or finish_reason
+                        text = (choice.get("delta") or {}).get("content")
+                        if text:
+                            pieces.append(text)
+                            on_text(text)
+    except httpx.HTTPError as e:
+        raise _llama_http_error(e, timeout)
+    if finish_reason is None:
+        # Every finished reply says why it stopped; one that doesn't was cut
+        # off, and must not be saved as if it were the whole answer.
+        raise HTTPException(status_code=502, detail=(
+            "The model stopped sending its reply before it finished. "
+            f"Check {llama_manager.log_path.name} for the technical details."))
+    return {"choices": [{"message": {"role": "assistant", "content": "".join(pieces)},
+                         "finish_reason": finish_reason}], "usage": usage}
+
+
+def _llama_http_error(e: httpx.HTTPError, timeout: float) -> HTTPException:
+    """What the page is told when a call to the model server fails."""
+    if isinstance(e, httpx.ReadTimeout):
+        return HTTPException(
             status_code=504,
             detail=f"The model is still generating a response after {round(timeout / 60)} minutes. "
                     "This can happen with long/complex requests on slower models, "
@@ -2307,14 +2376,17 @@ async def _local_completion(payload: dict, timeout: float | None = None) -> dict
                     "complete on the model server even though this request gave up — "
                     "check llama_server.log.",
         )
-    except httpx.ConnectError:
-        raise HTTPException(
+    if isinstance(e, httpx.ConnectError):
+        return HTTPException(
             status_code=503,
             detail="Cannot reach llama_cpp.server even though the process is alive. "
                     "It may still be loading the model.",
         )
-    except httpx.HTTPStatusError as e:
-        raise HTTPException(status_code=502, detail=_friendly_llama_error(e))
+    if isinstance(e, httpx.HTTPStatusError):
+        return HTTPException(status_code=502, detail=_friendly_llama_error(e))
+    return HTTPException(status_code=502, detail=(
+        f"Lost the connection to the model server partway through ({type(e).__name__}). "
+        "Check llama_server.log."))
 
 
 def _estimate_token_count(text: str) -> int:
@@ -2673,11 +2745,12 @@ async def _build_model_history(project_id: str, conversation: dict, perms: dict
     return history_for_model, history_was_trimmed, context_length, private_context
 
 
-async def _generate(history_for_model: list[dict], context_length: int
+async def _generate(history_for_model: list[dict], context_length: int, on_text=None
                     ) -> tuple[str, str | None, bool, dict]:
     """
     One reply from the model: (content, reasoning, whether it was still
-    cut short, token usage).
+    cut short, token usage). With on_text, the reply's raw text is also
+    handed to it piece by piece as it's written, continuations included.
 
     llama_cpp.server defaults an unset max_tokens to "fill whatever's
     left of the context window" — which, combined with never checking
@@ -2701,12 +2774,18 @@ async def _generate(history_for_model: list[dict], context_length: int
 
     for _round in range(MAX_CONTINUATION_ROUNDS + 1):
         payload = {"messages": current_messages, "max_tokens": RESPONSE_TOKEN_RESERVE}
+        streamed: list[str] = []
+        sink = (lambda text: (streamed.append(text), on_text(text))) if on_text else None
         if remote_client.active():
-            result = await _remote("POST", "/v1/chat/completions", payload)
+            result = await _remote("POST", "/v1/chat/completions", payload, on_text=sink)
+        elif sink and llama_manager.stream:
+            result = await _local_completion_stream(payload, sink)
         else:
             result = await _local_completion(payload)
         choice = result["choices"][0]
         piece = choice["message"]["content"]
+        if on_text and not streamed and piece:
+            on_text(piece)  # an engine (or a server from before v1.3) that answered in one piece
         finish_reason = choice.get("finish_reason")
         assistant_pieces.append(piece)
         for k, v in result.get("usage", {}).items():
@@ -2821,13 +2900,15 @@ def _agent_response(conversation: dict, start_index: int, final: dict | None, us
 
 
 async def _run_agent(project_id: str, conversation: dict, start_index: int,
-                     steps_used: int = 0, carry: dict | None = None) -> dict:
+                     steps_used: int = 0, carry: dict | None = None, emit=None) -> dict:
     """
     Model → action blocks → results → model, until it answers with no
     action, an action needs the person's approval (saved as the
     conversation's pending_action — /api/chat/approve picks it up from
     there), or MAX_AGENT_STEPS runs out. `carry` resumes a half-finished
-    batch of actions after an approval.
+    batch of actions after an approval. `emit`, when the page asked for a
+    streamed reply, gets each piece of text as the model writes it and
+    each tool step as it's saved (see _stream_events).
 
     With computer use off, a reply that only creates/deletes project
     files is confirmed inline with no extra model call — exactly how the
@@ -2842,6 +2923,12 @@ async def _run_agent(project_id: str, conversation: dict, start_index: int,
     response_cut_short = False
     private_context: list[str] = carry.get("private_context", []) if carry else []
     final: dict | None = None
+    on_text = (lambda text: emit({"type": "text", "text": text})) if emit else None
+
+    def add_step(message: dict) -> None:
+        conversation["messages"].append(message)
+        if emit:
+            emit({"type": "step", "message": message})
 
     while True:
         if carry is None:
@@ -2853,7 +2940,7 @@ async def _run_agent(project_id: str, conversation: dict, start_index: int,
             history, trimmed, context_length, private_context = await _build_model_history(
                 project_id, conversation, perms)
             history_trimmed = history_trimmed or trimmed
-            content, reasoning, response_cut_short, step_usage = await _generate(history, context_length)
+            content, reasoning, response_cut_short, step_usage = await _generate(history, context_length, on_text)
             steps_used += 1
             for k, v in step_usage.items():
                 usage[k] = usage.get(k, 0) + v
@@ -2873,8 +2960,8 @@ async def _run_agent(project_id: str, conversation: dict, start_index: int,
                 final = {"role": "assistant", "content": content.strip(), "reasoning": reasoning,
                          "timestamp": _now()}
                 break
-            conversation["messages"].append({"role": "assistant", "kind": "tool_call", "content": content,
-                                             "reasoning": reasoning, "timestamp": _now()})
+            add_step({"role": "assistant", "kind": "tool_call", "content": content,
+                      "reasoning": reasoning, "timestamp": _now()})
             queue, results = actions, []
         else:
             queue, results = carry["queue"], carry["results"]
@@ -2899,7 +2986,7 @@ async def _run_agent(project_id: str, conversation: dict, start_index: int,
                 results.append({"text": text, "public": action["type"] == "fetch" and not action.get("save")})
             queue = queue[1:]
 
-        conversation["messages"].append({
+        add_step({
             "role": "user", "kind": "tool_result", "timestamp": _now(),
             "public_only": all(r["public"] for r in results),
             "content": "\n\n".join(r["text"] for r in results)
@@ -2912,6 +2999,47 @@ async def _run_agent(project_id: str, conversation: dict, start_index: int,
     _save_conversation(conversation)
     return _agent_response(conversation, start_index, final, usage, history_trimmed,
                            response_cut_short, None)
+
+
+_replies_in_progress: set[asyncio.Task] = set()  # keeps a streamed reply's task alive after its page has gone
+
+
+def _stream_events(work) -> StreamingResponse:
+    """
+    Runs work(emit) — a _run_agent call — and sends the page what it
+    emits, one JSON object per line: {"type": "text"} pieces and
+    {"type": "step"} tool steps, then {"type": "done", ...} with the
+    same result the unstreamed endpoint returns, or {"type": "error",
+    "status", "detail"} (the HTTP status is already 200 by then).
+
+    The work runs as its own task, so a page that's reloaded or closed
+    partway doesn't stop it: the reply is still saved to the
+    conversation, as it was before replies were streamed.
+    """
+    events: asyncio.Queue = asyncio.Queue()
+
+    async def run():
+        try:
+            events.put_nowait({"type": "done", **await work(events.put_nowait)})
+        except HTTPException as e:
+            events.put_nowait({"type": "error", "status": e.status_code, "detail": e.detail})
+        except Exception as e:  # noqa: BLE001 — the page has to hear about it; the console gets the details
+            traceback.print_exc()
+            events.put_nowait({"type": "error", "status": 500,
+                               "detail": f"Something went wrong writing this reply ({type(e).__name__}: {e})."})
+
+    task = asyncio.create_task(run())
+    _replies_in_progress.add(task)
+    task.add_done_callback(_replies_in_progress.discard)
+
+    async def lines():
+        while True:
+            event = await events.get()
+            yield json.dumps(event) + "\n"
+            if event["type"] in ("done", "error"):
+                return
+
+    return StreamingResponse(lines(), media_type="application/x-ndjson")
 
 
 @app.post("/api/chat")
@@ -2947,11 +3075,16 @@ async def chat(request: ChatRequest, background_tasks: BackgroundTasks):
                 "timestamp": _now(),
             })
 
-    result = await _run_agent(request.project_id, conversation, len(conversation["messages"]))
+    start_index = len(conversation["messages"])
+    if request.stream:
+        result = _stream_events(lambda emit: _run_agent(request.project_id, conversation, start_index, emit=emit))
+    else:
+        result = await _run_agent(request.project_id, conversation, start_index)
 
     if is_new_conversation:
         first_user_message = next((m.content for m in request.messages if m.role == "user"), None)
         if first_user_message:
+            # A streamed reply gets these too: FastAPI runs them once it has been sent.
             background_tasks.add_task(
                 _title_background_task, request.project_id, conversation_id, first_user_message
             )
@@ -2963,6 +3096,7 @@ class ApprovalRequest(BaseModel):
     conversation_id: str
     action_id: str
     decision: str  # "once" | "always" | "deny"
+    stream: bool = False  # as in ChatRequest
 
 
 @app.post("/api/chat/approve")
@@ -3003,8 +3137,11 @@ async def approve_action(request: ApprovalRequest):
             results.append({"text": text, "public": action["type"] == "fetch" and not action.get("save")})
 
     carry = {"queue": pending["queue"][1:], "results": results, "private_context": pending["private_context"]}
-    return await _run_agent(request.project_id, conversation, len(conversation["messages"]),
-                            pending["steps_used"], carry)
+    start_index = len(conversation["messages"])
+    if request.stream:
+        return _stream_events(lambda emit: _run_agent(request.project_id, conversation, start_index,
+                                                      pending["steps_used"], carry, emit))
+    return await _run_agent(request.project_id, conversation, start_index, pending["steps_used"], carry)
 
 
 # ---- Computer-use permissions ----
@@ -3117,16 +3254,19 @@ class _GatewayHooks(server_mode.HostHooks):
                 "llama_status": await _local_llama_status(), "models": models,
                 "checkpoint": image_manager.current_checkpoint, "checkpoints": checkpoints}
 
-    async def chat(self, payload: dict) -> dict:
+    async def chat(self, payload: dict, on_text=None) -> dict:
         if not llama_manager.is_alive():
             raise HTTPException(status_code=409, detail=(
                 "The server's chat model isn't running right now — it may be generating images. "
                 "Try again in a moment."))
         max_tokens = payload.get("max_tokens")
-        return await _local_completion({
+        payload = {
             "messages": payload["messages"],
             "max_tokens": max_tokens if isinstance(max_tokens, int) and 0 < max_tokens <= 4096 else RESPONSE_TOKEN_RESERVE,
-        })
+        }
+        if on_text and llama_manager.stream:
+            return await _local_completion_stream(payload, on_text)
+        return await _local_completion(payload)  # the device shows it in one piece
 
     async def tokenize_count(self, text: str) -> int | None:
         return await _local_token_count(text) if llama_manager.is_alive() else None

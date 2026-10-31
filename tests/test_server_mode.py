@@ -9,6 +9,7 @@ model itself is scripted, so no GPU or model files are needed.
 """
 
 import asyncio
+import json
 import socket
 import sys
 import tempfile
@@ -49,6 +50,14 @@ async def fake_completion(payload, timeout=900.0):
             "usage": {"total_tokens": 12}}
 
 
+async def fake_completion_stream(payload, on_text, timeout=900.0):
+    seen_by_model.append(payload["messages"][-1]["content"])
+    for text in ("Streamed ", "from the ", "server."):
+        on_text(text)
+    return {"choices": [{"message": {"content": "Streamed from the server."}, "finish_reason": "stop"}],
+            "usage": {}}
+
+
 async def fake_token_count(text):
     return len(text) // 4
 
@@ -70,6 +79,7 @@ async def no_title(*args):
 
 
 main._local_completion = fake_completion
+main._local_completion_stream = fake_completion_stream
 main._local_token_count = fake_token_count
 main._local_llama_status = fake_status
 main._comfy_txt2img = fake_txt2img
@@ -155,6 +165,17 @@ def test_chat_runs_on_the_server_and_stays_on_the_device():
     health = client.get("/api/health").json()
     assert health["llama_cpp_server"] == "ok" and health["remote"]["name"]
     assert main.server.status()["waiting"] == 0
+
+
+def test_a_streamed_reply_comes_through_the_gateway_in_pieces():
+    project_id = client.post("/api/projects", json={"name": "Remote stream"}).json()["id"]
+    response = client.post("/api/chat", json={"project_id": project_id, "stream": True,
+                                              "messages": [{"role": "user", "content": "stream please"}]})
+    assert response.status_code == 200, response.text
+    events = [json.loads(line) for line in response.text.splitlines() if line.strip()]
+    assert [e.get("text") for e in events[:-1]] == ["Streamed ", "from the ", "server."], events
+    assert events[-1]["type"] == "done" and events[-1]["reply"] == "Streamed from the server."
+    assert seen_by_model[-1] == "stream please" and main.server.status()["waiting"] == 0
 
 
 def test_images_come_back_to_the_device():

@@ -228,10 +228,15 @@ def forget() -> dict:
 # ---- Using it ----
 
 async def call(method: str, path: str, *, json_body: dict | None = None, content: bytes | None = None,
-               timeout: float = 900.0) -> dict:
+               timeout: float = 900.0, on_text=None) -> dict:
+    """One request to the server. With on_text (chat completions only),
+    the reply is streamed: on_text gets each piece as the server's model
+    writes it, and the whole completion is still returned at the end. A
+    server from before v1.3 answers in one piece, which is returned as is."""
     global _last_error
     try:
-        result = await _call(method, path, json_body=json_body, content=content, timeout=timeout)
+        result = await _call(method, path, json_body=json_body, content=content, timeout=timeout,
+                             on_text=on_text)
     except RemoteError as e:
         _last_error = e.detail
         raise
@@ -239,18 +244,40 @@ async def call(method: str, path: str, *, json_body: dict | None = None, content
     return result
 
 
+async def _read_streamed_reply(response: httpx.Response, on_text) -> dict:
+    async for line in response.aiter_lines():
+        if not line.strip():
+            continue
+        event = json.loads(line)
+        if "text" in event:
+            on_text(event["text"])
+        elif "error" in event:
+            raise RemoteError(int(event["error"].get("status", 502)), str(event["error"].get("detail", "")))
+        elif "result" in event:
+            return event["result"]
+    raise RemoteError(502, "The server's reply ended before it finished.")
+
+
 async def _call(method: str, path: str, *, json_body: dict | None, content: bytes | None,
-                timeout: float) -> dict:
+                timeout: float, on_text=None) -> dict:
     server = state().get("server")
     if not server:
         raise RemoteError(400, "Not connected to a server.")
     headers = {"Authorization": f"Bearer {server['token']}", "X-Device-Id": state()["device_id"]}
     if content is not None:
         headers["Content-Type"] = "application/octet-stream"
+    url = _base(server["host"], server["port"]) + path
     try:
         async with httpx.AsyncClient(verify=_pinned(server["cert_pem"]), timeout=timeout, trust_env=False) as client:
-            response = await client.request(method, _base(server["host"], server["port"]) + path,
-                                            json=json_body, content=content, headers=headers)
+            if on_text is None:
+                response = await client.request(method, url, json=json_body, content=content, headers=headers)
+            else:
+                async with client.stream(method, url, json={**(json_body or {}), "stream": True},
+                                         headers=headers) as response:
+                    if (response.status_code < 400
+                            and response.headers.get("content-type", "").startswith("application/x-ndjson")):
+                        return await _read_streamed_reply(response, on_text)
+                    await response.aread()
     except httpx.ConnectError as e:
         if "CERTIFICATE" in str(e).upper():
             raise RemoteError(503, f"{server['name']}'s identity doesn't match the one it paired with — it may "

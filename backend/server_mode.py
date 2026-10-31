@@ -45,7 +45,7 @@ import uuid
 from pathlib import Path
 
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 
 APP_ROOT = Path(__file__).resolve().parent.parent
 SERVER_DIR = APP_ROOT / "server"
@@ -187,7 +187,7 @@ class HostHooks:
     same code path this computer's own chat and image generation use."""
 
     async def info(self) -> dict: ...
-    async def chat(self, payload: dict) -> dict: ...
+    async def chat(self, payload: dict, on_text=None) -> dict: ...  # on_text: each piece as it's written
     async def tokenize_count(self, text: str) -> int | None: ...
     async def generate_image(self, prompt: str) -> tuple[bytes, str | None, str | None]: ...
     async def caption(self, image: bytes) -> str | None: ...
@@ -428,6 +428,33 @@ class ServerMode:
                 self.waiting -= 1
             self.in_flight[device_id] -= 1
 
+    async def _streamed_chat(self, device_id: str, payload: dict):
+        """A chat reply sent as it's written, one JSON object per line:
+        {"text"} pieces, then {"result"} (the whole completion, as the
+        unstreamed answer) or {"error": {"status", "detail"}}. A device
+        that hangs up stops the job, and with it the model's work."""
+        events: asyncio.Queue = asyncio.Queue()
+
+        async def run():
+            try:
+                async with self._model_job(device_id):
+                    result = await self.hooks.chat(payload, on_text=lambda text: events.put_nowait({"text": text}))
+                events.put_nowait({"result": result})
+            except HTTPException as e:
+                events.put_nowait({"error": {"status": e.status_code, "detail": e.detail}})
+            except Exception as e:  # noqa: BLE001 — reported to the device without its request's content
+                events.put_nowait({"error": {"status": 500, "detail": f"The server failed ({type(e).__name__})."}})
+
+        job = asyncio.create_task(run())
+        try:
+            while True:
+                event = await events.get()
+                yield json.dumps(event) + "\n"
+                if "text" not in event:
+                    return
+        finally:
+            job.cancel()  # nothing to do once it's finished; stops it if the device went away
+
     def _build_app(self) -> FastAPI:
         app = FastAPI(title="LLMlifeline server", docs_url=None, redoc_url=None, openapi_url=None)
         mode = self
@@ -493,6 +520,9 @@ class ServerMode:
             payload = {"messages": body.get("messages"), "max_tokens": body.get("max_tokens")}
             if not isinstance(payload["messages"], list):
                 raise HTTPException(status_code=400, detail="messages must be a list.")
+            if body.get("stream") is True:
+                return StreamingResponse(mode._streamed_chat(device_id, payload),
+                                         media_type="application/x-ndjson")
             async with mode._model_job(device_id):
                 return await mode.hooks.chat(payload)
 

@@ -125,8 +125,13 @@ def test_paths():
 replies: list[str] = []
 
 
-async def fake_generate(history, context_length):
-    return replies.pop(0), None, False, {}
+async def fake_generate(history, context_length, on_text=None):
+    reply = replies.pop(0)
+    if on_text:  # a streamed reply arrives in pieces
+        half = len(reply) // 2
+        on_text(reply[:half])
+        on_text(reply[half:])
+    return reply, None, False, {}
 
 
 async def fake_token_count(text):
@@ -222,6 +227,53 @@ def test_skipping_an_approval_keeps_turns_alternating():
     merged = main._merge_consecutive_roles([{"role": m["role"], "content": m["content"]}
                                             for m in conversation["messages"]])
     assert all(a["role"] != b["role"] for a, b in zip(merged, merged[1:]))
+
+
+def streamed(path, body) -> list[dict]:
+    response = client.post(path, json={**body, "stream": True})
+    assert response.status_code == 200, response.text
+    assert response.headers["content-type"].startswith("application/x-ndjson")
+    return [json.loads(line) for line in response.text.splitlines() if line.strip()]
+
+
+def test_a_streamed_reply_shows_steps_and_text_as_they_happen():
+    cu.save_permissions({})
+    project_id, files = new_project()
+    (files / "notes.txt").write_text("hello")
+    replies[:] = ["```file-action\naction: read\npath: notes.txt\n```", "It says hello."]
+    events = streamed("/api/chat", {"project_id": project_id,
+                                    "messages": [{"role": "user", "content": "what does notes.txt say"}]})
+    kinds = [e["type"] if e["type"] != "step" else e["message"]["kind"] for e in events]
+    assert kinds == ["text", "text", "tool_call", "tool_result", "text", "text", "done"], kinds
+    assert "".join(e["text"] for e in events[4:6]) == "It says hello."
+    done = events[-1]
+    assert done["reply"] == "It says hello." and len(done["steps"]) == 2  # the same steps, for a page that missed them
+    saved = main._load_conversation(project_id, done["conversation_id"])["messages"]
+    assert saved[-1]["content"] == "It says hello."
+
+
+def test_a_streamed_approval_continues_in_pieces():
+    cu.save_permissions(ON)
+    project_id, _ = new_project()
+    replies[:] = ["```run-command\ncommand: echo streamed-ok\n```"]
+    events = streamed("/api/chat", {"project_id": project_id,
+                                    "messages": [{"role": "user", "content": "run echo"}]})
+    done = events[-1]
+    assert done["type"] == "done" and done["pending_action"] and done["reply"] is None
+    replies[:] = ["It printed streamed-ok."]
+    events = streamed("/api/chat/approve", {"project_id": project_id, "conversation_id": done["conversation_id"],
+                                            "action_id": done["pending_action"]["id"], "decision": "once"})
+    assert [e["type"] for e in events] == ["step", "text", "text", "done"], events  # the command's output, then the reply
+    assert events[-1]["reply"] == "It printed streamed-ok." and "streamed-ok" in events[-1]["steps"][0]["content"]
+
+
+def test_a_failure_partway_is_reported_in_the_stream():
+    cu.save_permissions({})
+    project_id, _ = new_project()
+    replies[:] = []  # the scripted model has nothing to say: pop() fails mid-reply
+    events = streamed("/api/chat", {"project_id": project_id,
+                                    "messages": [{"role": "user", "content": "hi"}]})
+    assert [e["type"] for e in events] == ["error"] and events[0]["status"] == 500, events
 
 
 def test_only_this_app_can_call_the_backend():

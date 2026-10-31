@@ -43,6 +43,7 @@ LAUNCH_DEFAULTS = {
     "request_timeout": 900,
     "model_titles": True,                # False: don't spend a model call naming each conversation
     "request_options": {},               # extra fields for every chat request, e.g. sampling settings
+    "stream": True,                      # False: the engine can't send a reply as it's written
 }
 
 _addons: dict | None = None
@@ -204,6 +205,7 @@ def launch_spec(ref: str, port: int) -> dict:
         raise AddonError(f"The add-on {key}'s request_options must be a dict.")
     for name in ("context_length", "startup_timeout", "request_timeout"):
         full[name] = int(full[name])
+    full["stream"] = bool(full["stream"])
     return full
 
 

@@ -35,6 +35,8 @@ jobs:
       - run: python tests/test_server_mode.py
       # Model folders and engine add-ons.
       - run: python tests/test_model_sources.py
+      # Replies streamed as they're written.
+      - run: python tests/test_streaming.py
 
   macos:
     needs: tests

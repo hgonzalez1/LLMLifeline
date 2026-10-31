@@ -1,5 +1,14 @@
 A private AI chat and image generator that runs on your own computer. No cloud, no subscription, no account.
 
+## New in 1.3: replies as they're written, and more models to choose from
+
+- **Replies appear as they're written,** word by word, so you can start reading right away instead of waiting for the whole answer. A model's reasoning shows in a collapsed **Reasoning** section. With computer use, each step appears as the assistant takes it. A reply still finishes and is saved if you reload or close the page.
+- **Server mode streams too.** A device using a computer that runs 1.3 sees replies as they're written. A sharing computer still on 1.2 answers in one piece, as before.
+- **Models kept in other folders:** create `model-folders.txt` in the LLMlifeline folder and list folders of `.gguf` models, one per line, for example a fast SSD. They join the model dropdown, which now groups models under headings.
+- **Engine add-ons** let LLMlifeline use models another program runs, such as a model too big for your memory that streams from disk. See `addons/README.md` for how to write or install one. Only install add-ons you trust.
+- **Your last model loads next time.** LLMlifeline starts with the chat model you used last.
+- **Fixed:** stopping or switching a model now ends every process it started, so its memory is freed straight away.
+
 ## New in 1.2: share one model across your home network
 
 Open **🖧 Network** in the sidebar. One computer, usually the one with the strongest graphics card, shares its model, and your other computers use it. **Every computer keeps its own projects, chats, files and settings.** Only the model's work (writing replies, drawing images, describing photos) happens on the sharing computer.
