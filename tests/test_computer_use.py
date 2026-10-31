@@ -276,6 +276,16 @@ def test_a_failure_partway_is_reported_in_the_stream():
     assert [e["type"] for e in events] == ["error"] and events[0]["status"] == 500, events
 
 
+def test_the_project_list_counts_only_conversations():
+    cu.save_permissions({})
+    project_id, _ = new_project()
+    replies[:] = ["Hello."]
+    say(project_id, "hi")
+    assert (main._project_dir(project_id) / "conversations" / "_keyword_index.json").exists()  # kept beside them
+    project = next(p for p in client.get("/api/projects").json()["projects"] if p["id"] == project_id)
+    assert project["conversation_count"] == 1, project
+
+
 def test_only_this_app_can_call_the_backend():
     assert client.get("/api/permissions").status_code == 200
     assert client.get("/api/permissions", headers={"Origin": "https://evil.example"}).status_code == 403

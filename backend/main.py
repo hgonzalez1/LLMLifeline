@@ -1288,6 +1288,12 @@ def _require_project(project_id: str) -> dict:
     return json.loads(meta_path.read_text(encoding="utf-8"))
 
 
+def _conversation_files(conv_dir: Path) -> list[Path]:
+    """The saved conversations in a project's conversations folder, not the
+    keyword index kept beside them (see _keyword_index_path)."""
+    return [p for p in conv_dir.glob("*.json") if p.name != "_keyword_index.json"]
+
+
 @app.get("/api/projects")
 def list_projects():
     """Return every project: id, name, created_at, conversation count."""
@@ -1301,7 +1307,7 @@ def list_projects():
             continue
         meta = json.loads(meta_path.read_text(encoding="utf-8"))
         conv_dir = project_path / "conversations"
-        conv_count = len(list(conv_dir.glob("*.json"))) if conv_dir.exists() else 0
+        conv_count = len(_conversation_files(conv_dir))
         results.append({
             "id": meta["id"],
             "name": meta["name"],
@@ -1355,9 +1361,7 @@ def list_project_images(project_id: str):
     captions_by_filename: dict[str, str | None] = {}
     conv_dir = _project_dir(project_id) / "conversations"
     if conv_dir.exists():
-        for conv_file in conv_dir.glob("*.json"):
-            if conv_file.name == "_keyword_index.json":
-                continue
+        for conv_file in _conversation_files(conv_dir):
             try:
                 conversation = json.loads(conv_file.read_text(encoding="utf-8"))
             except (json.JSONDecodeError, OSError):
@@ -2112,10 +2116,7 @@ def list_conversations(project_id: str):
     _require_project(project_id)
     conv_dir = _project_dir(project_id) / "conversations"
     results = []
-    for path in sorted(conv_dir.glob("*.json"), reverse=True):
-        if path.name == "_keyword_index.json":
-            continue  # cache file, not a conversation — lives in the same folder
-
+    for path in sorted(_conversation_files(conv_dir), reverse=True):
         try:
             data = json.loads(path.read_text(encoding="utf-8"))
         except (json.JSONDecodeError, OSError):
