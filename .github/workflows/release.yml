@@ -56,6 +56,7 @@ jobs:
       - name: Build LLMlifeline.app
         run: |
           python -m PyInstaller --windowed --onedir --name LLMlifeline \
+            --icon LLMlifeline.icns \
             --osx-bundle-identifier io.github.hgonzalez1.llmlifeline \
             --add-data "backend:payload/backend" \
             --add-data "frontend:payload/frontend" \
@@ -138,7 +139,7 @@ jobs:
         with:
           python-version: "3.12"
       - run: python -m pip install pyinstaller
-      - run: python -m PyInstaller --onefile --console --name LLMlifeline launcher.py
+      - run: python -m PyInstaller --onefile --console --name LLMlifeline --icon LLMlifeline.ico launcher.py
 
       # Copied from the checkout (not git archive) so the .bat files keep
       # the CRLF line endings cmd.exe needs.

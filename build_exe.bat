@@ -41,6 +41,7 @@ REM --console: kept deliberately, not --windowed. First-run dependency
 REM installs and cold model loads take minutes; a non-technical user
 REM needs to see something happening, not a window that looks frozen.
 "%VENV_PYTHON%" -m PyInstaller --onefile --console --name LLMlifeline ^
+    --icon "%CD%\LLMlifeline.ico" ^
     --distpath "%CD%" --workpath "%CD%\build" --specpath "%CD%\build" ^
     launcher.py
 
