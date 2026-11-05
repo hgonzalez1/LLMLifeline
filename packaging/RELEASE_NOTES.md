@@ -1,5 +1,9 @@
 A private AI chat and image generator that runs on your own computer. No cloud, no subscription, no account.
 
+## New in 1.3.4: LLMlifeline has its own icon
+
+- **A proper app icon.** LLMlifeline now shows a bronze Celtic-knot medallion instead of a generic file icon — on the Windows `.exe`, the macOS app, and the browser tab. Nothing about how it works changes.
+
 ## New in 1.3.3: drop or paste an image into the prompt
 
 - **Add an image by dragging it onto the window or pasting it from your clipboard.** Drag an image (or any file the 📎 button accepts) anywhere onto LLMlifeline, or copy an image and paste it with Ctrl+V in the message box, and it attaches to your message, the same as the 📎 button does. Before, a file dragged onto the window just opened in a new browser tab, and a pasted image went nowhere.
