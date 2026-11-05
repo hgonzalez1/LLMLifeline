@@ -1,5 +1,10 @@
 A private AI chat and image generator that runs on your own computer. No cloud, no subscription, no account.
 
+## New in 1.3.3: drop or paste an image into the prompt
+
+- **Add an image by dragging it onto the window or pasting it from your clipboard.** Drag an image (or any file the 📎 button accepts) anywhere onto LLMlifeline, or copy an image and paste it with Ctrl+V in the message box, and it attaches to your message, the same as the 📎 button does. Before, a file dragged onto the window just opened in a new browser tab, and a pasted image went nowhere.
+- **The built-in persona stays on topic.** The default persona no longer tacks a remark about its purpose onto an answer that didn't call for one, so a technical question gets just the technical answer. This changes only the default persona shipped in a fresh install; your own `persona.txt` is yours, and updates never overwrite it.
+
 ## New in 1.3.2: big models run much faster on your graphics card
 
 - **Models bigger than your graphics card now load only the part that fits.** Each time a `.gguf` model loads, LLMlifeline checks how much memory your NVIDIA card(s) have free and puts as many of the model's layers on the card as fit; the rest run on the processor. Before, Windows quietly moved the overflow into slow shared memory. On an 11 GB RTX 2080 Ti this took Qwen3-30B-A3B from about 5.5 to 21 tokens per second, a dense 27B from 0.6 to 3.3, and a 9B model that barely overflowed from 17 to 26.

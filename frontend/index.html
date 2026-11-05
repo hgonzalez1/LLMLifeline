@@ -439,6 +439,7 @@
   }
   #composer #upload-btn:hover { color: var(--text); border-color: #555; }
   #composer #upload-btn:disabled { opacity: 0.4; cursor: not-allowed; }
+  #composer.drag-over { box-shadow: 0 0 0 2px var(--accent) inset; border-radius: 8px; }
 
   /* ---- Modal ---- */
   #modal-overlay {
@@ -2250,6 +2251,43 @@ el("upload-input").addEventListener("change", (e) => {
   const file = e.target.files[0];
   if (file) uploadFile(file);
   e.target.value = ""; // clear so re-uploading the same filename still fires 'change'
+});
+
+// Drag a file anywhere onto the window, or paste an image from the clipboard,
+// to send it to the prompt — same as the 📎 button. Without a drop handler the
+// browser's default is to open the dropped file in a new tab, and a pasted
+// image would otherwise go nowhere.
+function hasFiles(dt) {
+  return dt && Array.from(dt.types || []).includes("Files");
+}
+["dragenter", "dragover"].forEach((evt) =>
+  window.addEventListener(evt, (e) => {
+    if (!hasFiles(e.dataTransfer)) return;
+    e.preventDefault(); // allow the drop (and stop the browser opening the file)
+    if (currentProjectId) el("composer").classList.add("drag-over");
+  })
+);
+window.addEventListener("dragleave", (e) => {
+  if (e.relatedTarget === null) el("composer").classList.remove("drag-over"); // left the window
+});
+window.addEventListener("drop", (e) => {
+  if (!hasFiles(e.dataTransfer)) return;
+  e.preventDefault();
+  el("composer").classList.remove("drag-over");
+  const file = e.dataTransfer.files[0];
+  if (file) uploadFile(file); // uploadFile no-ops if no project is selected
+});
+el("input-box").addEventListener("paste", (e) => {
+  for (const item of (e.clipboardData && e.clipboardData.items) || []) {
+    if (item.kind === "file") {
+      const file = item.getAsFile();
+      if (file) {
+        e.preventDefault(); // keep the image out of the text box
+        uploadFile(file);
+        return;
+      }
+    }
+  }
 });
 el("input-box").addEventListener("keydown", (e) => {
   if (e.key === "Enter" && !e.shiftKey) {
