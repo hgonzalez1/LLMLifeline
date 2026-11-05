@@ -32,7 +32,7 @@ import time
 import webbrowser
 from pathlib import Path
 
-APP_VERSION = "1.3.1"  # matches the GitHub release tag (v1.3.1)
+APP_VERSION = "1.3.2"  # matches the GitHub release tag (v1.3.2)
 
 IS_WINDOWS = sys.platform == "win32"
 IS_MAC = sys.platform == "darwin"

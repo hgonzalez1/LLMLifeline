@@ -1,5 +1,10 @@
 A private AI chat and image generator that runs on your own computer. No cloud, no subscription, no account.
 
+## New in 1.3.2: big models run much faster on your graphics card
+
+- **Models bigger than your graphics card now load only the part that fits.** Each time a `.gguf` model loads, LLMlifeline checks how much memory your NVIDIA card(s) have free and puts as many of the model's layers on the card as fit; the rest run on the processor. Before, Windows quietly moved the overflow into slow shared memory. On an 11 GB RTX 2080 Ti this took Qwen3-30B-A3B from about 5.5 to 21 tokens per second, a dense 27B from 0.6 to 3.3, and a 9B model that barely overflowed from 17 to 26.
+- **It learns each model.** The first load of a model may happen twice, because only then does LLMlifeline learn its exact memory needs. It remembers them in `gpu-fit.json`, so later loads go straight to the best fit. With two cards, the model is spread across both.
+
 ## Fixed in 1.3.1
 
 - **Conversation counts in the sidebar are right again.** Each project showed one conversation too many, because a search index saved beside the chats was counted as a chat.
