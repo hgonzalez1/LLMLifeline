@@ -1,5 +1,9 @@
 A private AI chat and image generator that runs on your own computer. No cloud, no subscription, no account.
 
+## New in 1.3.5: the default persona stays neutral
+
+- **The built-in persona answers what you ask, and nothing more.** It no longer brings up faith, scripture, God, or a sense of purpose on its own — not to open an answer and not to close one. If you want to talk about those things it still can, warmly and grounded in the texts it has access to; it simply waits for you to raise them first. This changes only the default persona shipped in a fresh install; your own `persona.txt` is yours, and updates never overwrite it. The included Bible and study texts are unchanged.
+
 ## New in 1.3.4: LLMlifeline has its own icon
 
 - **A proper app icon.** LLMlifeline now shows a bronze Celtic-knot medallion instead of a generic file icon — on the Windows `.exe`, the macOS app, and the browser tab. Nothing about how it works changes.
