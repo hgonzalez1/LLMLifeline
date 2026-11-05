@@ -37,6 +37,8 @@ jobs:
       - run: python tests/test_model_sources.py
       # Replies streamed as they're written.
       - run: python tests/test_streaming.py
+      # How much of a .gguf goes on the graphics card.
+      - run: python tests/test_gpu_fit.py
 
   macos:
     needs: tests

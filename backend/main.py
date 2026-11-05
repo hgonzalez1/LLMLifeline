@@ -51,6 +51,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 import computer_use
+import gpu_fit
 import model_sources
 import remote_client
 import server_mode
@@ -81,6 +82,8 @@ LLAMA_SERVER_HOST = "127.0.0.1"
 LLAMA_SERVER_PORT = 8000
 LLAMA_SERVER_URL = f"http://{LLAMA_SERVER_HOST}:{LLAMA_SERVER_PORT}"
 DEFAULT_MODEL = MODELS_DIR / "Qwen3-30B-A3B-Q4_K_M.gguf"  # by file name, in any model folder (see model_sources)
+# What each .gguf really needed on this computer's graphics cards (see gpu_fit.py).
+gpu_fit.MEMORY_FILE = APP_ROOT / "gpu-fit.json"
 
 PROJECTS_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -170,45 +173,43 @@ async def _caption_for(image_path: Path) -> str:
 
 # ---- llama_cpp.server process management ----
 
-def _detect_free_vram_mb() -> int | None:
+def _gpu_memory_mb() -> list[tuple[int, int]]:
     """
-    Query free VRAM via nvidia-smi — the same command confirmed working
-    throughout this entire build's manual testing, now used
-    programmatically at startup instead of by hand. Returns None if
-    nvidia-smi isn't available (no NVIDIA GPU, drivers not installed,
-    or running on a machine without one) rather than raising, since a
-    missing GPU should fall back to a safe default, not crash startup.
+    (free, total) VRAM in MiB of each NVIDIA card, via nvidia-smi — the
+    same command confirmed working throughout this entire build's manual
+    testing. Empty if nvidia-smi isn't available (no NVIDIA GPU, drivers
+    not installed, a Mac) rather than raising, since a missing GPU should
+    fall back to a safe default, not crash startup.
     """
     try:
         result = subprocess.run(
-            ["nvidia-smi", "--query-gpu=memory.free", "--format=csv,noheader,nounits"],
+            ["nvidia-smi", "--query-gpu=memory.free,memory.total", "--format=csv,noheader,nounits"],
             capture_output=True, text=True, timeout=10,
         )
-        if result.returncode == 0 and result.stdout.strip():
-            return int(result.stdout.strip().splitlines()[0])
+        if result.returncode == 0:
+            return [(int(free), int(total)) for free, total in
+                    (line.split(",") for line in result.stdout.strip().splitlines() if line.strip())]
     except (subprocess.SubprocessError, FileNotFoundError, ValueError, OSError):
         pass
-    return None
+    return []
+
+
+def _detect_free_vram_mb() -> int | None:
+    """Free VRAM across every NVIDIA card (llama.cpp spreads a model's
+    layers over all of them), or None without one."""
+    gpus = _gpu_memory_mb()
+    return sum(free for free, _ in gpus) if gpus else None
 
 
 def _detect_total_vram_mb() -> int | None:
     """
-    Same approach as _detect_free_vram_mb, but the card's total capacity
-    rather than what's free right now — needed to recognize when a
-    model's file size alone already exceeds the whole card, not just
-    the current headroom on it. Returns None under the same conditions
-    _detect_free_vram_mb does.
+    Same as _detect_free_vram_mb, but the cards' total capacity rather
+    than what's free right now — needed to recognize when a model's file
+    size alone already exceeds the whole card, not just the current
+    headroom on it.
     """
-    try:
-        result = subprocess.run(
-            ["nvidia-smi", "--query-gpu=memory.total", "--format=csv,noheader,nounits"],
-            capture_output=True, text=True, timeout=10,
-        )
-        if result.returncode == 0 and result.stdout.strip():
-            return int(result.stdout.strip().splitlines()[0])
-    except (subprocess.SubprocessError, FileNotFoundError, ValueError, OSError):
-        pass
-    return None
+    gpus = _gpu_memory_mb()
+    return sum(total for _, total in gpus) if gpus else None
 
 
 def _choose_context_length(model_path: str, doubled: bool = False) -> int:
@@ -375,6 +376,13 @@ class LlamaServerManager:
         self.extended_context = False  # toggle: doubles the auto-selected context length
         self.load_started_at: float | None = None  # time.time() when the current/last load began
         self.context_length: int | None = None  # the real n_ctx the running server was launched with — set in start(), used by /api/chat to budget history against instead of guessing
+        # How much of a .gguf went on the graphics card(s) (see gpu_fit.py):
+        # the --n_gpu_layers it was launched with, the file's layer sizes and
+        # the cards' free memory just before, and whether refit() has run.
+        self.gpu_layers: int | None = None
+        self.layout: gpu_fit.Layout | None = None
+        self.gpu_free_mb: list[int] = []
+        self.refitted = True
         self._use_settings(model_sources.LAUNCH_DEFAULTS)
 
     def _use_settings(self, spec: dict) -> None:
@@ -386,7 +394,7 @@ class LlamaServerManager:
         self.request_options = dict(spec["request_options"])
         self.stream = spec["stream"]
 
-    def start(self, model_path: str):
+    def start(self, model_path: str, gpu_buffers_mb: float | None = None):
         """Launch the server for model_path (a .gguf file or an add-on model).
 
         Writes output to a log file rather than a PIPE — piping subprocess
@@ -394,6 +402,8 @@ class LlamaServerManager:
         inheritance issues that can cause the child process to fail to
         launch silently. A log file sidesteps that entirely and gives us
         a real record to inspect when something goes wrong.
+
+        gpu_buffers_mb is what refit() measured this .gguf's buffers at.
         """
         if self.process is not None:
             self.stop()
@@ -410,6 +420,7 @@ class LlamaServerManager:
         if spec is not None:
             self._use_settings(spec)
             self.context_length = spec["context_length"]
+            self.gpu_layers, self.layout, self.refitted = None, None, True
             self.process = subprocess.Popen(
                 spec["args"],
                 cwd=spec["cwd"],
@@ -427,11 +438,21 @@ class LlamaServerManager:
         self._use_settings({**model_sources.LAUNCH_DEFAULTS, "tokenize_path": "/extras/tokenize/count"})
         chosen_context = _choose_context_length(model_path, doubled=self.extended_context)
         self.context_length = chosen_context
+        # As many layers on the graphics card(s) as fit in their free memory
+        # now: asking for all of a model bigger than the card makes Windows
+        # spill the rest into shared memory, several times slower than
+        # leaving those layers to the CPU (see gpu_fit.py).
+        self.gpu_free_mb = [free for free, _ in _gpu_memory_mb()]
+        self.layout = gpu_fit.read_layout(model_path)
+        buffers = gpu_buffers_mb if gpu_buffers_mb is not None else (
+            gpu_fit.remembered_buffers(model_path, chosen_context) or gpu_fit.BUFFERS_GUESS_MIB)
+        self.gpu_layers = gpu_fit.gpu_layers(self.layout, self.gpu_free_mb, chosen_context, buffers)
+        self.refitted = gpu_buffers_mb is not None
         self.process = subprocess.Popen(
             [
                 sys.executable, "-m", "llama_cpp.server",
                 "--model", model_path,
-                "--n_gpu_layers", "-1",
+                "--n_gpu_layers", str(self.gpu_layers),
                 "--n_ctx", str(chosen_context),
                 "--host", LLAMA_SERVER_HOST,
                 "--port", str(LLAMA_SERVER_PORT),
@@ -448,8 +469,43 @@ class LlamaServerManager:
         model_sources.remember_model(model_path)
         extended_note = " (extended context ON)" if self.extended_context else ""
         print(f"[backend] Launched llama_cpp.server (PID {self.process.pid}), "
-              f"context={chosen_context}{extended_note} (auto-selected based on detected VRAM), "
-              f"output -> {self.log_path}")
+              f"context={chosen_context}{extended_note}, GPU layers={self.gpu_layers_note()} "
+              f"(auto-selected based on detected VRAM), output -> {self.log_path}")
+
+    def gpu_layers_note(self) -> str | None:
+        if self.gpu_layers is None:
+            return None
+        if self.gpu_layers == -1 or self.layout is None:
+            return "all" if self.gpu_layers == -1 else str(self.gpu_layers)
+        return f"{self.gpu_layers} of {self.layout.block_count + 1}"
+
+    def refit(self) -> bool:
+        """
+        Once a .gguf has loaded, read what llama.cpp really put on the
+        card(s) from its log. The compute and recurrent-state buffers were
+        only guessed at launch; with the real figure, if a different number
+        of layers fits (fewer, because it spilled into shared memory, or
+        more), launch it again with that number. Once per load, and the
+        figure is remembered for this model, so the next load is right from
+        the start. Returns whether it relaunched.
+        """
+        if self.refitted or self.layout is None or not self.gpu_free_mb or not self.current_model_path:
+            return False
+        self.refitted = True
+        try:
+            loaded = gpu_fit.loaded_buffers(self.log_path.read_text(encoding="utf-8", errors="replace"))
+        except OSError:
+            return False
+        if "compute" not in loaded:
+            return False  # a build without CUDA, or a log this doesn't recognize
+        buffers = loaded["compute"] + loaded.get("RS", 0.0)
+        gpu_fit.remember_buffers(self.current_model_path, self.context_length, buffers)
+        if gpu_fit.gpu_layers(self.layout, self.gpu_free_mb, self.context_length, buffers) == self.gpu_layers:
+            return False
+        print(f"[backend] The model's GPU buffers came to {buffers:.0f} MiB; relaunching with the "
+              f"number of layers that fits.")
+        self.start(self.current_model_path, gpu_buffers_mb=buffers)
+        return True
 
     def stop(self):
         """Terminate the current model server and its child processes, if any."""
@@ -556,6 +612,17 @@ image_manager = ImageServerManager()
 
 
 async def _wait_for_server_ready(timeout: int | None = None) -> bool:
+    """Wait until the model server answers. A .gguf whose GPU buffers
+    turned out different from the guess is relaunched once with the number
+    of layers that really fits (LlamaServerManager.refit), and waited for
+    again."""
+    ready = await _wait_until_answering(timeout)
+    if ready and llama_manager.refit():
+        ready = await _wait_until_answering(timeout)
+    return ready
+
+
+async def _wait_until_answering(timeout: int | None = None) -> bool:
     """Poll the model server's readiness path (llama_cpp.server's
     /v1/models, or whatever an add-on named) until it responds or we time
     out. Loading a multi-gigabyte model takes real time — this replaces a
@@ -3220,6 +3287,7 @@ async def health():
         "active_model": llama_manager.current_model_path,
         "extended_context": llama_manager.extended_context,
         "context_length": llama_manager.context_length,
+        "gpu_layers": llama_manager.gpu_layers_note(),
         "loading_elapsed_seconds": loading_elapsed_seconds,
         "remote": None,
         **network,

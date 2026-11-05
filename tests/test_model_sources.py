@@ -164,9 +164,10 @@ def test_the_backend_runs_an_addon_model_its_way():
         launched.append((args, kwargs))
         return FakeProcess()
 
-    real = main.subprocess.Popen, main._stop_process_tree, main._choose_context_length
+    real = main.subprocess.Popen, main._stop_process_tree, main._choose_context_length, main._gpu_memory_mb
     main.subprocess.Popen, main._stop_process_tree = fake_popen, lambda p, timeout=30: stopped.append(p.pid)
-    main._choose_context_length = lambda path, doubled=False: 2048  # it asks nvidia-smi through Popen
+    main._choose_context_length = lambda path, doubled=False: 2048  # these ask nvidia-smi through Popen
+    main._gpu_memory_mb = lambda: []
     manager = main.LlamaServerManager()
     manager.log_path = TMP / "llama_server.log"
     try:
@@ -191,8 +192,66 @@ def test_the_backend_runs_an_addon_model_its_way():
         assert manager.request_options == {} and manager.stream is True
         # Or a health check arriving mid-reply would end its stream early.
         assert args[args.index("--interrupt_requests") + 1] == "False"
+        assert args[args.index("--n_gpu_layers") + 1] == "-1"  # no NVIDIA card to measure: as before
     finally:
-        main.subprocess.Popen, main._stop_process_tree, main._choose_context_length = real
+        main.subprocess.Popen, main._stop_process_tree, main._choose_context_length, main._gpu_memory_mb = real
+        if manager.log_file is not None:
+            manager.log_file.close()
+
+
+def test_a_gguf_gets_the_layers_that_fit_and_one_correction_once_loaded():
+    import gpu_fit
+
+    launched = []
+    blocks = gpu_fit.Layout([100 * gpu_fit.MIB] * 10, 50 * gpu_fit.MIB, [0] * 10, 1000)
+    overheads = gpu_fit.CUDA_CONTEXT_MIB + gpu_fit.SAFETY_MARGIN_MIB
+    free = 350 + gpu_fit.BUFFERS_GUESS_MIB + overheads  # with the guessed buffers: the output and 3 layers
+
+    def layers():
+        args = launched[-1]
+        return args[args.index("--n_gpu_layers") + 1]
+
+    real = (main.subprocess.Popen, main._stop_process_tree, main._choose_context_length, main._gpu_memory_mb,
+            gpu_fit.read_layout, gpu_fit.MEMORY_FILE)
+    main.subprocess.Popen = lambda args, **kwargs: launched.append(args) or FakeProcess()
+    main._stop_process_tree = lambda p, timeout=30: None
+    main._choose_context_length = lambda path, doubled=False: 4096
+    main._gpu_memory_mb = lambda: [(free, 11264)]
+    gpu_fit.read_layout = lambda path: blocks
+    gpu_fit.MEMORY_FILE = TMP / "gpu-fit.json"
+    manager = main.LlamaServerManager()
+    manager.log_path = TMP / "llama_server.log"
+    model = str(EXTRA / "other.gguf")
+    try:
+        manager.start(model)
+        assert layers() == "4" and manager.gpu_layers_note() == "4 of 11"
+
+        # Loaded: its buffers were far smaller than guessed, so more layers fit.
+        manager.log_file.close()
+        manager.log_path.write_text("CUDA0 compute buffer size =    12.00 MiB\n", encoding="utf-8")
+        assert manager.refit() is True
+        assert layers() == "9" and len(launched) == 2
+        assert manager.refit() is False and len(launched) == 2  # once per load
+
+        # The next load of this model uses the real figure from the start.
+        manager.start(model)
+        assert layers() == "9"
+        manager.log_file.close()
+        manager.log_path.write_text("CUDA0 compute buffer size =    12.00 MiB\n", encoding="utf-8")
+        assert manager.refit() is False and len(launched) == 3
+
+        # A log without CUDA buffers (a CPU-only build) changes nothing.
+        gpu_fit.MEMORY_FILE.unlink()
+        manager.start(model)
+        manager.log_file.close()
+        manager.log_path.write_text("load_tensors: CPU model buffer size = 1000.00 MiB\n", encoding="utf-8")
+        assert manager.refit() is False and layers() == "4"
+
+        manager.start(GOOD)  # an add-on's model: its engine manages its own memory
+        assert manager.gpu_layers_note() is None and manager.refit() is False
+    finally:
+        (main.subprocess.Popen, main._stop_process_tree, main._choose_context_length, main._gpu_memory_mb,
+         gpu_fit.read_layout, gpu_fit.MEMORY_FILE) = real
         if manager.log_file is not None:
             manager.log_file.close()
 

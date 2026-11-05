@@ -42,11 +42,13 @@ server/
 remote.json
 lightweight-install.txt
 
-# Extra model folders, engine add-ons and the chat model last used — what
-# this computer has installed and chose. addons/README.md (how to write
+# Extra model folders, engine add-ons, the chat model last used and what
+# each model needed on this computer's graphics cards — what this
+# computer has installed and chose. addons/README.md (how to write
 # one) is the only shipped part of addons/.
 model-folders.txt
 last-chat-model.txt
+gpu-fit.json
 addons/*
 !addons/README.md
 
