@@ -94,6 +94,9 @@
   .bubble code { background: #121212; padding: 1px 5px; border-radius: 5px; font-size: 0.9em; }
   .bubble pre code { background: none; padding: 0; }
   .bubble.empty::after { content: "…"; color: var(--muted); }
+  .bubble img { max-width: 100%; border-radius: 10px; display: block; margin: 2px 0; }
+  .bubble .cap { color: var(--muted); font-size: 12.5px; margin-top: 6px; }
+  .sysnote { align-self: center; color: var(--muted); font-size: 12.5px; text-align: center; max-width: 92%; line-height: 1.45; }
   .think { color: var(--muted); font-size: 13px; }
   .think summary { cursor: pointer; }
 
@@ -122,6 +125,7 @@
 <header id="chat-header" class="hidden">
   <span class="dot" id="hdr-dot"></span>
   <span class="title"><b id="hdr-name">LLMlifeline</b><span id="hdr-model">connecting…</span></span>
+  <button id="mode-btn" class="hidden">🖼 Image</button>
   <button id="menu-btn">Menu</button>
 </header>
 
@@ -184,6 +188,9 @@ if (!S.history) S.history = [];   // [{role, content}]
 
 let generating = false;
 let stopFlag = false;
+let curMode = "chat";       // the computer's mode, from /v1/info — chat or image
+let allowImages = false;    // the computer shares image generation
+let allowSwitching = false; // devices may change the computer's mode
 
 // --- tiny markdown (escape first, then a safe subset) ---
 function esc(s) { const d = document.createElement("div"); d.textContent = s; return d.innerHTML; }
@@ -298,9 +305,53 @@ async function refreshInfo() {
     if (r.status === 401) { disconnectedByServer(); return; }
     if (!r.ok) throw new Error();
     const j = await r.json();
+    curMode = j.mode === "image" ? "image" : "chat";
+    allowImages = !!j.allow_images;
+    allowSwitching = !!j.allow_switching;
     $("hdr-dot").classList.add("on");
-    $("hdr-model").textContent = j.mode === "image" ? "image mode" : (j.model || "ready");
+    $("hdr-model").textContent = curMode === "image" ? ((j.checkpoint || "image") + " · image") : (j.model || "ready");
+    applyMode();
   } catch { $("hdr-model").textContent = "can't reach the computer"; $("hdr-dot").classList.remove("on"); }
+}
+
+function applyMode() {
+  const btn = $("mode-btn");
+  btn.classList.toggle("hidden", !allowImages);     // show the toggle whenever the computer shares images
+  btn.textContent = curMode === "image" ? "💬 Chat" : "🖼 Image";
+  $("input").placeholder = curMode === "image" ? "Describe an image" : "Message";
+}
+
+function systemNote(text) {
+  const n = document.createElement("div");
+  n.className = "sysnote";
+  n.textContent = text;
+  $("msgs").appendChild(n);
+  scrollDown();
+}
+
+async function toggleMode() {
+  const target = curMode === "image" ? "chat" : "image";
+  if (target === "image" && !confirm("Switch the computer to image mode? This changes the model for everyone using it.")) return;
+  if (target === "chat" && !confirm("Switch the computer back to chat mode for everyone using it?")) return;
+  const btn = $("mode-btn"); btn.disabled = true;
+  try {
+    const r = await fetch("/v1/mode", {
+      method: "POST", headers: { ...authHeaders(), "Content-Type": "application/json" },
+      body: JSON.stringify({ mode: target }),
+    });
+    if (r.status === 401) { disconnectedByServer(); return; }
+    if (r.status === 403) {
+      systemNote("The computer doesn't let devices change its mode. On the computer, turn on Image Model, or allow devices to switch in the 🖧 Network panel.");
+      return;
+    }
+    if (!r.ok) { systemNote((await r.json().catch(() => ({}))).detail || "Couldn't switch the mode."); return; }
+    await refreshInfo();
+    systemNote(curMode === "image" ? "The computer is in image mode. Describe an image and send it." : "The computer is back in chat mode.");
+  } catch {
+    systemNote("Couldn't reach the computer to switch the mode.");
+  } finally {
+    $("mode-btn").disabled = false;
+  }
 }
 function disconnectedByServer() {
   S.token = null; store();
@@ -335,6 +386,7 @@ async function send() {
   const text = input.value.trim();
   if (!text || generating) return;
   input.value = ""; input.style.height = "auto";
+  if (curMode === "image") { generateImage(text); return; }
   S.history.push({ role: "user", content: text });
   addBubble("user", text);
   store(); scrollDown();
@@ -345,7 +397,8 @@ async function send() {
   stopFlag = false;
 
   // send a trimmed tail of the conversation so context stays in bounds
-  const msgs = S.history.slice(-24);
+  // (image exchanges are left out — they aren't chat turns for the model)
+  const msgs = S.history.filter((m) => m.kind !== "image").slice(-24).map((m) => ({ role: m.role, content: m.content }));
   let acc = "";
   try {
     const res = await fetch("/v1/chat/completions", {
@@ -391,6 +444,50 @@ async function send() {
   }
 }
 
+async function generateImage(prompt) {
+  S.history.push({ role: "user", content: prompt, kind: "image" });
+  addBubble("user", prompt);
+  store(); scrollDown();
+  const bubble = addBubble("assistant", "");
+  bubble.classList.remove("empty");
+  bubble.innerHTML = '<span class="spin"></span>Generating…';
+  scrollDown();
+  const btn = $("send");
+  generating = true; btn.disabled = true; btn.textContent = "…";
+  try {
+    const res = await fetch("/v1/images/generate", {
+      method: "POST", headers: { ...authHeaders(), "Content-Type": "application/json" },
+      body: JSON.stringify({ prompt }),
+    });
+    if (res.status === 401) { disconnectedByServer(); return; }
+    if (!res.ok) {
+      const detail = (await res.json().catch(() => ({}))).detail || ("The computer answered " + res.status + ".");
+      bubble.innerHTML = renderMd("⚠️ " + detail);
+      if (res.status === 409) refreshInfo();   // the computer isn't in image mode anymore
+      return;
+    }
+    const j = await res.json();
+    bubble.innerHTML = "";
+    const img = document.createElement("img");
+    img.src = "data:image/png;base64," + j.image_base64;
+    img.alt = prompt;
+    bubble.appendChild(img);
+    if (j.caption) {
+      const cap = document.createElement("div");
+      cap.className = "cap"; cap.textContent = j.caption;
+      bubble.appendChild(cap);
+    }
+    // keep only a light note in history (not the image) so storage stays small
+    S.history.push({ role: "assistant", content: "🖼 " + (j.caption || "image"), kind: "image" });
+    store();
+  } catch (e) {
+    bubble.innerHTML = renderMd("⚠️ " + (e.message || "Couldn't generate the image."));
+  } finally {
+    generating = false; btn.disabled = false; btn.textContent = "Send";
+    scrollDown();
+  }
+}
+
 // --- menu ---
 function menu() {
   const choice = prompt("Type:  new  — start a fresh chat\n       disconnect  — forget this computer", "");
@@ -412,6 +509,7 @@ $("connect-btn").addEventListener("click", connect);
 $("dev-name").addEventListener("keydown", (e) => { if (e.key === "Enter") connect(); });
 $("wait-cancel").addEventListener("click", () => { stopWaiting(); S.requestId = null; store(); show("connect"); });
 $("menu-btn").addEventListener("click", menu);
+$("mode-btn").addEventListener("click", toggleMode);
 $("send").addEventListener("click", () => { if (generating) { stopFlag = true; } else { send(); } });
 const input = $("input");
 input.addEventListener("input", () => { input.style.height = "auto"; input.style.height = Math.min(input.scrollHeight, 140) + "px"; });

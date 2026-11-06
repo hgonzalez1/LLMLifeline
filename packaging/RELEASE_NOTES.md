@@ -1,5 +1,11 @@
 A private AI chat and image generator that runs on your own computer. No cloud, no subscription, no account.
 
+## New in 1.3.8: make images from your phone too
+
+- **Generate images from the phone page.** When your computer is set to make images, the phone's chat gains a **🖼 Image / 💬 Chat** switch. In image mode, type what you want to see and the computer renders it — the picture and its caption appear right in the thread.
+- **Switch modes from the phone, if you allow it.** If you've ticked "devices can change the model and mode" in the 🖧 Network panel, the phone can flip the computer between chat and images itself, with a reminder that this changes the model for everyone using it. Otherwise the phone simply follows whatever mode the computer is in, and tells you how to turn image sharing on.
+- As with everything else, the picture stays on your phone; nothing about it is saved on the computer.
+
 ## New in 1.3.7: use it from your phone or tablet
 
 - **Open LLMlifeline in your phone's browser.** Turn on **Share this computer's model** in the 🖧 Network panel, and it now shows a web address like `https://192.168.1.20:8100`. Type that into Safari or Chrome on any phone or tablet on your home WiFi, approve the device once on the computer, and you have a full chat with the computer's model — no app to install. iPhone, iPad and Android all work the same way.
