@@ -1,5 +1,10 @@
 A private AI chat and image generator that runs on your own computer. No cloud, no subscription, no account.
 
+## New in 1.3.6: stop a reply while it's being written
+
+- **A Stop button.** While the assistant is writing, the Send button turns into a red **Stop**. Press it to halt the reply right away — it cuts the model off so your graphics card is freed immediately, not left running to the end out of sight. Whatever had been written stays on screen; it isn't saved, the same as closing the page mid-reply. Before, once a long reply started there was no way to interrupt it.
+- **A new prompt interrupts the current one.** Type a new message and press Enter while a reply is still being written, and it stops the current reply and sends your new one.
+
 ## New in 1.3.5: the default persona stays neutral
 
 - **The built-in persona answers what you ask, and nothing more.** It no longer brings up faith, scripture, God, or a sense of purpose on its own — not to open an answer and not to close one. If you want to talk about those things it still can, warmly and grounded in the texts it has access to; it simply waits for you to raise them first. This changes only the default persona shipped in a fresh install; your own `persona.txt` is yours, and updates never overwrite it. The included Bible and study texts are unchanged.
