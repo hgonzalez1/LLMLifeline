@@ -3070,25 +3070,36 @@ async def _run_agent(project_id: str, conversation: dict, start_index: int,
 
 
 _replies_in_progress: set[asyncio.Task] = set()  # keeps a streamed reply's task alive after its page has gone
+_active_replies: dict[str, asyncio.Task] = {}  # project_id -> its in-flight streamed reply, so /api/chat/stop can cancel it
 
 
-def _stream_events(work) -> StreamingResponse:
+def _stream_events(work, cancel_key: str | None = None, conversation_id: str | None = None) -> StreamingResponse:
     """
     Runs work(emit) — a _run_agent call — and sends the page what it
     emits, one JSON object per line: {"type": "text"} pieces and
     {"type": "step"} tool steps, then {"type": "done", ...} with the
-    same result the unstreamed endpoint returns, or {"type": "error",
-    "status", "detail"} (the HTTP status is already 200 by then).
+    same result the unstreamed endpoint returns, {"type": "error",
+    "status", "detail"} (the HTTP status is already 200 by then), or
+    {"type": "stopped"} when /api/chat/stop cancelled it.
 
     The work runs as its own task, so a page that's reloaded or closed
     partway doesn't stop it: the reply is still saved to the
-    conversation, as it was before replies were streamed.
+    conversation, as it was before replies were streamed. Stopping it is
+    deliberate instead: /api/chat/stop cancels the task by cancel_key,
+    which closes the connection to the model server — llama_cpp.server
+    stops generating when its client disconnects, so the graphics card is
+    freed. What was written so far streamed to the page already; it isn't
+    saved, the same as a reply whose page closed mid-write.
     """
     events: asyncio.Queue = asyncio.Queue()
 
     async def run():
         try:
             events.put_nowait({"type": "done", **await work(events.put_nowait)})
+        except asyncio.CancelledError:
+            events.put_nowait({"type": "stopped", "conversation_id": conversation_id})
+            # Deliberate: the person pressed Stop. Swallow the cancellation
+            # so the page gets the "stopped" line instead of a dropped stream.
         except HTTPException as e:
             events.put_nowait({"type": "error", "status": e.status_code, "detail": e.detail})
         except Exception as e:  # noqa: BLE001 — the page has to hear about it; the console gets the details
@@ -3098,13 +3109,21 @@ def _stream_events(work) -> StreamingResponse:
 
     task = asyncio.create_task(run())
     _replies_in_progress.add(task)
-    task.add_done_callback(_replies_in_progress.discard)
+    if cancel_key is not None:
+        _active_replies[cancel_key] = task
+
+    def _finished(t: asyncio.Task) -> None:
+        _replies_in_progress.discard(t)
+        if cancel_key is not None and _active_replies.get(cancel_key) is t:
+            _active_replies.pop(cancel_key, None)
+
+    task.add_done_callback(_finished)
 
     async def lines():
         while True:
             event = await events.get()
             yield json.dumps(event) + "\n"
-            if event["type"] in ("done", "error"):
+            if event["type"] in ("done", "error", "stopped"):
                 return
 
     return StreamingResponse(lines(), media_type="application/x-ndjson")
@@ -3145,7 +3164,8 @@ async def chat(request: ChatRequest, background_tasks: BackgroundTasks):
 
     start_index = len(conversation["messages"])
     if request.stream:
-        result = _stream_events(lambda emit: _run_agent(request.project_id, conversation, start_index, emit=emit))
+        result = _stream_events(lambda emit: _run_agent(request.project_id, conversation, start_index, emit=emit),
+                                cancel_key=request.project_id, conversation_id=conversation_id)
     else:
         result = await _run_agent(request.project_id, conversation, start_index)
 
@@ -3208,8 +3228,28 @@ async def approve_action(request: ApprovalRequest):
     start_index = len(conversation["messages"])
     if request.stream:
         return _stream_events(lambda emit: _run_agent(request.project_id, conversation, start_index,
-                                                      pending["steps_used"], carry, emit))
+                                                      pending["steps_used"], carry, emit),
+                              cancel_key=request.project_id, conversation_id=request.conversation_id)
     return await _run_agent(request.project_id, conversation, start_index, pending["steps_used"], carry)
+
+
+class StopRequest(BaseModel):
+    project_id: str
+
+
+@app.post("/api/chat/stop")
+async def stop_chat(request: StopRequest):
+    """The Stop button: cancel the project's in-flight streamed reply.
+    Cancelling closes the connection to llama_cpp.server, which stops it
+    generating, so the graphics card is freed right away. Whatever was
+    written so far stayed on the page; it isn't saved. Returns whether a
+    reply was actually in progress to stop."""
+    _require_project(request.project_id)
+    task = _active_replies.get(request.project_id)
+    if task is not None and not task.done():
+        task.cancel()
+        return {"stopped": True}
+    return {"stopped": False}
 
 
 # ---- Computer-use permissions ----

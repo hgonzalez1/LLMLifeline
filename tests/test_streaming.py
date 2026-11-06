@@ -162,6 +162,35 @@ def test_a_server_from_before_streaming_answers_in_one_piece():
     assert requests[-1]["stream"] is True and content == "Old reply." and got == ["Old reply."], got
 
 
+def test_stop_cancels_an_in_flight_reply_and_says_so():
+    # The Stop button: /api/chat/stop cancels the reply's task by project id,
+    # which ends the stream with a "stopped" line instead of dropping it, and
+    # clears the project from the in-flight registry.
+    async def scenario():
+        started = asyncio.Event()
+
+        async def work(emit):
+            emit({"type": "text", "text": "Thinking"})
+            started.set()
+            await asyncio.Event().wait()  # stands in for a long generation that never returns on its own
+            return {}  # unreachable — the task is cancelled first
+
+        resp = main._stream_events(lambda emit: work(emit), cancel_key="proj-1", conversation_id="conv-9")
+        it = resp.body_iterator
+        first = json.loads(await it.__anext__())
+        await started.wait()
+        assert "proj-1" in main._active_replies, "the in-flight reply should be registered to stop"
+        main._active_replies["proj-1"].cancel()  # what /api/chat/stop does
+        rest = [json.loads(chunk) async for chunk in it]
+        await asyncio.sleep(0)  # let the done-callback run
+        return first, rest
+
+    first, rest = asyncio.run(scenario())
+    assert first == {"type": "text", "text": "Thinking"}, first
+    assert rest == [{"type": "stopped", "conversation_id": "conv-9"}], rest
+    assert "proj-1" not in main._active_replies, "the stopped reply should be cleared from the registry"
+
+
 if __name__ == "__main__":
     failures = 0
     for name, test in list(globals().items()):

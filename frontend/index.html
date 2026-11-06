@@ -428,6 +428,8 @@
     cursor: pointer;
   }
   #composer button:disabled { opacity: 0.5; cursor: not-allowed; }
+  #composer button.stop { background: #c0392b; }
+  #composer button.stop:hover { background: #a93226; }
   #composer #upload-btn {
     background: transparent;
     color: #9a9a9a;
@@ -830,6 +832,8 @@ const API_BASE = "";
 
 let currentProjectId = null;
 let currentConversationId = null;
+let generating = false;     // a streamed chat reply is in progress (the Send button is showing Stop)
+let queuedMessage = null;   // a message typed while generating, sent once the current reply stops
 let selectedModel = null;
 let selectedCheckpoint = null;
 let activeMode = "chat"; // "chat" | "image" — only one is ever active at a time
@@ -896,6 +900,7 @@ async function apiStream(path, body, onEvent) {
       if (!line) continue;
       const event = JSON.parse(line);
       if (event.type === "done") return event;
+      if (event.type === "stopped") return { stopped: true, conversation_id: event.conversation_id };
       if (event.type === "error") {
         throw new Error(`POST ${path} failed: ${event.status} — ${JSON.stringify({ detail: event.detail })}`);
       }
@@ -1628,6 +1633,57 @@ function formatTimestamp(isoString) {
 
 // ---------- Sending messages ----------
 
+/** The Send button doubles as a red Stop button while a reply is streaming. */
+function setSendButton(mode) {
+  const btn = el("send-btn");
+  if (mode === "stop") {
+    generating = true;
+    btn.textContent = "Stop";
+    btn.title = "Stop generating";
+    btn.classList.add("stop");
+    btn.disabled = false;
+  } else {
+    generating = false;
+    btn.textContent = "Send";
+    btn.title = "";
+    btn.classList.remove("stop");
+    btn.disabled = !currentProjectId;
+  }
+}
+
+/** Tell the backend to stop the in-flight reply. It closes the model-server
+ * connection, which frees the graphics card; the stream then ends with a
+ * "stopped" line. What was written so far stays on screen but isn't saved. */
+async function stopGeneration() {
+  if (!generating || !currentProjectId) return;
+  el("send-btn").disabled = true; // debounce the click; the reply's own finally restores the button
+  try {
+    await fetch(`${API_BASE}/api/chat/stop`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ project_id: currentProjectId }),
+    });
+  } catch (e) {
+    // The stream ends on its own even if this request fails — nothing else to do.
+  }
+}
+
+/** Run at the end of every streamed reply: restore the Send button and, if a
+ * message was typed while this one was running, send it now. */
+function finishReply(typing) {
+  setSendButton("send");
+  typing.classList.remove("visible");
+  typing.textContent = "Generating…"; // reset for next send
+  if (queuedMessage !== null) {
+    const q = queuedMessage;
+    queuedMessage = null;
+    const input = el("input-box");
+    input.value = q;
+    input.style.height = "auto";
+    sendMessage();
+  }
+}
+
 async function sendMessage() {
   const input = el("input-box");
   const text = input.value.trim();
@@ -1657,13 +1713,19 @@ async function sendMessage() {
       addMessageBubble("assistant", caption, null, data.image_url, data.timestamp);
     } else {
       document.querySelectorAll(".approval-card button").forEach((b) => (b.disabled = true)); // a new message skips any open approval
+      setSendButton("stop"); // the Send button becomes Stop while the reply streams
       const data = await apiStream("/api/chat", {
         project_id: currentProjectId,
         conversation_id: currentConversationId,
         messages: [{ role: "user", content: text }],
       }, (event) => showStreamEvent(event, draft));
-      draft.clear();
-      showAgentResponse(data, true);
+      if (data.stopped) {
+        draft.stop(); // the person pressed Stop; what streamed stays on screen, unsaved
+        if (data.conversation_id) currentConversationId = data.conversation_id;
+      } else {
+        draft.clear();
+        showAgentResponse(data, true);
+      }
     }
     await loadProjects(); // conversation count changed
     await loadConversations(currentProjectId, currentConversationId); // new/updated conversation in the picker
@@ -1672,9 +1734,7 @@ async function sendMessage() {
     draft.stop(); // what was written before the failure stays above the error, though it isn't saved
     addMessageBubble("assistant", `[Error] ${e.message}`);
   } finally {
-    el("send-btn").disabled = false;
-    typing.classList.remove("visible");
-    typing.textContent = "Generating…"; // reset for next send
+    finishReply(typing); // restore the Send button; send anything typed while this reply ran
   }
 }
 
@@ -1740,7 +1800,7 @@ async function answerApproval(actionId, decision, card, answer, label) {
   const typing = el("typing-indicator");
   typing.textContent = decision === "deny" ? "Continuing…" : "Working…";
   typing.classList.add("visible");
-  el("send-btn").disabled = true;
+  setSendButton("stop"); // the reply continues streaming — offer Stop
   const draft = startDraft();
   try {
     const data = await apiStream("/api/chat/approve", {
@@ -1749,17 +1809,20 @@ async function answerApproval(actionId, decision, card, answer, label) {
       action_id: actionId,
       decision,
     }, (event) => showStreamEvent(event, draft));
-    draft.clear();
-    showAgentResponse(data, true);
+    if (data.stopped) {
+      draft.stop();
+      if (data.conversation_id) currentConversationId = data.conversation_id;
+    } else {
+      draft.clear();
+      showAgentResponse(data, true);
+    }
     if (decision === "always") refreshPermissionsState();
     await loadConversations(currentProjectId, currentConversationId);
   } catch (e) {
     draft.stop();
     addMessageBubble("assistant", `[Error] ${e.message}`);
   } finally {
-    el("send-btn").disabled = false;
-    typing.classList.remove("visible");
-    typing.textContent = "Generating…";
+    finishReply(typing);
   }
 }
 
@@ -2246,7 +2309,10 @@ document.addEventListener("keydown", (e) => {
   if (e.key === "Escape" && el("network-overlay").classList.contains("visible")) closeNetwork();
 });
 
-el("send-btn").addEventListener("click", sendMessage);
+el("send-btn").addEventListener("click", () => {
+  if (generating) stopGeneration(); // the button is showing Stop
+  else sendMessage();
+});
 el("upload-btn").addEventListener("click", () => el("upload-input").click());
 el("upload-input").addEventListener("change", (e) => {
   const file = e.target.files[0];
@@ -2293,7 +2359,19 @@ el("input-box").addEventListener("paste", (e) => {
 el("input-box").addEventListener("keydown", (e) => {
   if (e.key === "Enter" && !e.shiftKey) {
     e.preventDefault();
-    sendMessage();
+    if (generating) {
+      // A reply is still streaming. Stop it; if the box has a new prompt,
+      // queue it so it sends the moment the current reply stops (supersede).
+      const next = el("input-box").value.trim();
+      if (next) {
+        queuedMessage = next;
+        el("input-box").value = "";
+        el("input-box").style.height = "auto";
+      }
+      stopGeneration();
+    } else {
+      sendMessage();
+    }
   }
 });
 el("input-box").addEventListener("input", (e) => {
