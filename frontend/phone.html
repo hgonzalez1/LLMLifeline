@@ -1,0 +1,428 @@
+<!doctype html>
+<!-- llmlifeline-phone: the page a phone or tablet browser loads from the
+     server-mode gateway (server_mode.py serves it at GET /). It pairs over
+     the same encrypted connection, then chats with this computer's model.
+     The conversation lives only in this browser; the computer keeps none of
+     it (same promise as every other server-mode device). -->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="LLMlifeline">
+<meta name="theme-color" content="#161616">
+<title>LLMlifeline</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%23161616'/%3E%3Ccircle cx='16' cy='16' r='8' fill='none' stroke='%237da8d8' stroke-width='2.4'/%3E%3C/svg%3E">
+<style>
+  :root {
+    --bg: #161616; --panel: #1f1f1f; --panel-2: #262626; --line: #3a3a3a;
+    --text: #ececec; --muted: #9a9a9a; --accent: #4f7fbf; --accent-2: #3f6aa6;
+    --user: #2f4a6e; --danger: #c0392b;
+  }
+  * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+  html, body { height: 100%; margin: 0; }
+  body {
+    background: var(--bg); color: var(--text);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, system-ui, sans-serif;
+    font-size: 16px; line-height: 1.5;
+    display: flex; flex-direction: column; height: 100dvh;
+    overscroll-behavior-y: none;
+  }
+  header {
+    display: flex; align-items: center; gap: 10px;
+    padding: calc(env(safe-area-inset-top) + 10px) 14px 10px;
+    background: var(--panel); border-bottom: 1px solid var(--line);
+    position: sticky; top: 0; z-index: 5;
+  }
+  header .dot { width: 9px; height: 9px; border-radius: 50%; background: #666; flex: none; }
+  header .dot.on { background: #4caf50; }
+  header .title { flex: 1; min-width: 0; }
+  header .title b { display: block; font-size: 15px; }
+  header .title span { display: block; font-size: 12px; color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  header button {
+    flex: none; background: none; border: 1px solid var(--line); color: var(--text);
+    border-radius: 8px; padding: 7px 10px; font-size: 13px; cursor: pointer;
+  }
+  header button:active { background: var(--panel-2); }
+
+  main { flex: 1; overflow-y: auto; -webkit-overflow-scrolling: touch; padding: 14px; }
+
+  /* ---- Connect / pairing screen ---- */
+  .screen { max-width: 520px; margin: 24px auto; padding: 0 16px; }
+  .screen h1 { font-size: 22px; margin: 0 0 6px; }
+  .screen p { color: var(--muted); font-size: 14px; }
+  .card {
+    background: var(--panel); border: 1px solid var(--line); border-radius: 14px;
+    padding: 18px; margin-top: 18px;
+  }
+  .card label { display: block; font-size: 13px; color: var(--muted); margin-bottom: 6px; }
+  .card input[type=text] {
+    width: 100%; background: var(--panel-2); border: 1px solid var(--line); color: var(--text);
+    border-radius: 10px; padding: 12px; font-size: 16px;
+  }
+  .btn {
+    display: block; width: 100%; margin-top: 14px; background: var(--accent); color: #fff;
+    border: none; border-radius: 10px; padding: 14px; font-size: 16px; font-weight: 600; cursor: pointer;
+  }
+  .btn:active { background: var(--accent-2); }
+  .btn:disabled { opacity: 0.55; }
+  .btn.ghost { background: none; border: 1px solid var(--line); color: var(--text); font-weight: 500; }
+  .note { font-size: 12.5px; color: var(--muted); margin-top: 14px; line-height: 1.5; }
+  .error { color: #ef9a9a; font-size: 13.5px; margin-top: 12px; min-height: 1em; }
+  .spin {
+    width: 18px; height: 18px; border: 2px solid var(--line); border-top-color: var(--accent);
+    border-radius: 50%; display: inline-block; vertical-align: -3px; margin-right: 8px;
+    animation: spin 0.8s linear infinite;
+  }
+  @keyframes spin { to { transform: rotate(360deg); } }
+
+  /* ---- Chat ---- */
+  .msgs { max-width: 760px; margin: 0 auto; display: flex; flex-direction: column; gap: 12px; }
+  .bubble {
+    padding: 10px 13px; border-radius: 14px; max-width: 85%;
+    white-space: normal; word-wrap: break-word; overflow-wrap: anywhere;
+  }
+  .bubble.user { align-self: flex-end; background: var(--user); border-bottom-right-radius: 5px; }
+  .bubble.assistant { align-self: flex-start; background: var(--panel); border: 1px solid var(--line); border-bottom-left-radius: 5px; }
+  .bubble p { margin: 0 0 8px; } .bubble p:last-child { margin-bottom: 0; }
+  .bubble pre {
+    background: #121212; border: 1px solid var(--line); border-radius: 8px; padding: 10px;
+    overflow-x: auto; font-size: 13px; margin: 8px 0;
+  }
+  .bubble code { background: #121212; padding: 1px 5px; border-radius: 5px; font-size: 0.9em; }
+  .bubble pre code { background: none; padding: 0; }
+  .bubble.empty::after { content: "…"; color: var(--muted); }
+  .think { color: var(--muted); font-size: 13px; }
+  .think summary { cursor: pointer; }
+
+  footer {
+    padding: 10px 12px calc(env(safe-area-inset-bottom) + 10px);
+    background: var(--panel); border-top: 1px solid var(--line);
+  }
+  .composer { max-width: 760px; margin: 0 auto; display: flex; gap: 8px; align-items: flex-end; }
+  .composer textarea {
+    flex: 1; resize: none; background: var(--panel-2); border: 1px solid var(--line); color: var(--text);
+    border-radius: 12px; padding: 11px 13px; font-size: 16px; line-height: 1.4; max-height: 140px;
+    font-family: inherit;
+  }
+  .composer button {
+    flex: none; background: var(--accent); color: #fff; border: none; border-radius: 12px;
+    width: 52px; height: 46px; font-size: 15px; font-weight: 600; cursor: pointer;
+  }
+  .composer button:active { background: var(--accent-2); }
+  .composer button.stop { background: var(--danger); }
+  .composer button:disabled { opacity: 0.5; }
+  .hidden { display: none !important; }
+</style>
+</head>
+<body>
+
+<header id="chat-header" class="hidden">
+  <span class="dot" id="hdr-dot"></span>
+  <span class="title"><b id="hdr-name">LLMlifeline</b><span id="hdr-model">connecting…</span></span>
+  <button id="menu-btn">Menu</button>
+</header>
+
+<main>
+  <!-- Connect / pairing -->
+  <div id="connect" class="screen">
+    <h1>LLMlifeline</h1>
+    <p id="connect-sub">Connect this device to your computer's model.</p>
+    <div class="card" id="connect-card">
+      <label for="dev-name">This device's name</label>
+      <input id="dev-name" type="text" autocomplete="off" autocapitalize="words" placeholder="My phone">
+      <button class="btn" id="connect-btn">Connect</button>
+      <div class="error" id="connect-error"></div>
+    </div>
+    <div class="note" id="connect-note"></div>
+  </div>
+
+  <!-- Waiting for approval -->
+  <div id="waiting" class="screen hidden">
+    <h1>Waiting for approval</h1>
+    <div class="card">
+      <p style="color:var(--text)"><span class="spin"></span>Asking <b id="wait-name">your computer</b> to let this device in…</p>
+      <p class="note">On that computer, open <b>🖧 Network</b>. A request from
+        “<b id="wait-dev"></b>” is waiting there — approve it and this page continues on its own.</p>
+      <button class="btn ghost" id="wait-cancel">Cancel</button>
+      <div class="error" id="wait-error"></div>
+    </div>
+  </div>
+
+  <!-- Chat -->
+  <div id="chat" class="hidden">
+    <div class="msgs" id="msgs"></div>
+  </div>
+</main>
+
+<footer id="composer-bar" class="hidden">
+  <div class="composer">
+    <textarea id="input" rows="1" placeholder="Message" autocomplete="off"></textarea>
+    <button id="send">Send</button>
+  </div>
+</footer>
+
+<script>
+"use strict";
+const $ = (id) => document.getElementById(id);
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+// --- stored state (this browser only) ---
+const KEY = "llmlifeline.v1";
+function load() {
+  try { return JSON.parse(localStorage.getItem(KEY)) || {}; } catch { return {}; }
+}
+function store() {
+  try { localStorage.setItem(KEY, JSON.stringify(S)); } catch { /* private mode: keep going in memory */ }
+}
+const S = load();
+if (!S.deviceId) S.deviceId = (crypto.randomUUID ? crypto.randomUUID() : String(Math.random()).slice(2) + Date.now());
+if (!S.deviceName) S.deviceName = "My phone";
+if (!S.history) S.history = [];   // [{role, content}]
+
+let generating = false;
+let stopFlag = false;
+
+// --- tiny markdown (escape first, then a safe subset) ---
+function esc(s) { const d = document.createElement("div"); d.textContent = s; return d.innerHTML; }
+function renderMd(text) {
+  // pull a leading <think>…</think> out into a collapsed note
+  let think = "";
+  const m = text.match(/^\s*<think>([\s\S]*?)<\/think>/i);
+  if (m) { think = m[1].trim(); text = text.slice(m[0].length); }
+  const blocks = [];
+  // fenced code
+  text = text.replace(/```([\s\S]*?)```/g, (_, code) => {
+    blocks.push(`<pre><code>${esc(code.replace(/^\n/, ""))}</code></pre>`);
+    return `\u0000${blocks.length - 1}\u0000`;
+  });
+  let html = esc(text)
+    .replace(/`([^`\n]+)`/g, (_, c) => `<code>${c}</code>`)
+    .replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>")
+    .replace(/(^|[^*])\*([^*\n]+)\*/g, "$1<em>$2</em>");
+  html = html.split(/\n{2,}/).map((p) => `<p>${p.replace(/\n/g, "<br>")}</p>`).join("");
+  html = html.replace(/\u0000(\d+)\u0000/g, (_, i) => blocks[+i]);
+  if (think) html = `<details class="think"><summary>Thinking</summary>${esc(think).replace(/\n/g, "<br>")}</details>` + html;
+  return html;
+}
+
+// --- screens ---
+function show(name) {
+  for (const id of ["connect", "waiting", "chat"]) $(id).classList.toggle("hidden", id !== name);
+  $("chat-header").classList.toggle("hidden", name !== "chat");
+  $("composer-bar").classList.toggle("hidden", name !== "chat");
+}
+
+// --- API to the gateway (same origin) ---
+function authHeaders() {
+  return { "Authorization": "Bearer " + S.token, "X-Device-Id": S.deviceId };
+}
+async function hello() {
+  const r = await fetch("/v1/hello", { cache: "no-store" });
+  if (!r.ok) throw new Error("This address isn't answering as LLMlifeline.");
+  const j = await r.json();
+  if (j.app !== "LLMlifeline") throw new Error("This address isn't an LLMlifeline server.");
+  return j;
+}
+
+// --- pairing ---
+async function connect() {
+  const err = $("connect-error");
+  err.textContent = "";
+  S.deviceName = ($("dev-name").value || "My phone").trim().slice(0, 60) || "My phone";
+  store();
+  const btn = $("connect-btn");
+  btn.disabled = true; btn.textContent = "Connecting…";
+  try {
+    let info; try { info = await hello(); } catch (e) { err.textContent = e.message; return; }
+    if (!S.secret) S.secret = (crypto.randomUUID ? crypto.randomUUID() : "") + Math.random().toString(36).slice(2) + Date.now().toString(36);
+    const r = await fetch("/v1/pair", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ device_id: S.deviceId, device_name: S.deviceName, secret: S.secret }),
+    });
+    if (!r.ok) { err.textContent = (await r.json().catch(() => ({}))).detail || "Couldn't ask to connect."; return; }
+    S.requestId = (await r.json()).request_id;
+    S.serverName = info.name || "your computer";
+    store();
+    startWaiting();
+  } catch (e) {
+    err.textContent = e.message || "Couldn't reach the computer.";
+  } finally {
+    btn.disabled = false; btn.textContent = "Connect";
+  }
+}
+
+let waitTimer = null;
+function startWaiting() {
+  $("wait-name").textContent = S.serverName || "your computer";
+  $("wait-dev").textContent = S.deviceName;
+  $("wait-error").textContent = "";
+  show("waiting");
+  pollPairing();
+}
+function stopWaiting() { if (waitTimer) { clearTimeout(waitTimer); waitTimer = null; } }
+async function pollPairing() {
+  try {
+    const r = await fetch("/v1/pair/" + encodeURIComponent(S.requestId), {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ secret: S.secret }),
+    });
+    if (r.status === 404) { $("wait-error").textContent = "That request timed out. Tap Cancel and try again."; return; }
+    const j = await r.json();
+    if (j.status === "approved") {
+      S.token = j.token; S.serverName = j.name || S.serverName; S.requestId = null;
+      store();
+      openChat();
+      return;
+    }
+    if (j.status === "denied") { $("wait-error").textContent = "The computer declined this device."; return; }
+  } catch (e) {
+    $("wait-error").textContent = "Still trying to reach the computer…";
+  }
+  waitTimer = setTimeout(pollPairing, 1500);
+}
+
+// --- chat ---
+async function openChat() {
+  stopWaiting();
+  show("chat");
+  $("hdr-name").textContent = S.serverName || "LLMlifeline";
+  renderHistory();
+  refreshInfo();
+}
+async function refreshInfo() {
+  try {
+    const r = await fetch("/v1/info", { headers: authHeaders(), cache: "no-store" });
+    if (r.status === 401) { disconnectedByServer(); return; }
+    if (!r.ok) throw new Error();
+    const j = await r.json();
+    $("hdr-dot").classList.add("on");
+    $("hdr-model").textContent = j.mode === "image" ? "image mode" : (j.model || "ready");
+  } catch { $("hdr-model").textContent = "can't reach the computer"; $("hdr-dot").classList.remove("on"); }
+}
+function disconnectedByServer() {
+  S.token = null; store();
+  $("connect-sub").textContent = "This computer disconnected this device. Connect again to reconnect.";
+  show("connect");
+}
+
+function renderHistory() {
+  const box = $("msgs"); box.innerHTML = "";
+  for (const m of S.history) addBubble(m.role, m.content);
+  scrollDown();
+}
+function addBubble(role, content) {
+  const b = document.createElement("div");
+  b.className = "bubble " + (role === "user" ? "user" : "assistant");
+  if (role === "user") b.textContent = content; else b.innerHTML = content ? renderMd(content) : "";
+  if (role !== "user" && !content) b.classList.add("empty");
+  $("msgs").appendChild(b);
+  return b;
+}
+function scrollDown() { const m = document.querySelector("main"); m.scrollTop = m.scrollHeight; }
+
+function setSend(mode) {
+  const btn = $("send");
+  generating = mode === "stop";
+  btn.textContent = generating ? "Stop" : "Send";
+  btn.classList.toggle("stop", generating);
+}
+
+async function send() {
+  const input = $("input");
+  const text = input.value.trim();
+  if (!text || generating) return;
+  input.value = ""; input.style.height = "auto";
+  S.history.push({ role: "user", content: text });
+  addBubble("user", text);
+  store(); scrollDown();
+
+  const bubble = addBubble("assistant", "");
+  scrollDown();
+  setSend("stop");
+  stopFlag = false;
+
+  // send a trimmed tail of the conversation so context stays in bounds
+  const msgs = S.history.slice(-24);
+  let acc = "";
+  try {
+    const res = await fetch("/v1/chat/completions", {
+      method: "POST",
+      headers: { ...authHeaders(), "Content-Type": "application/json" },
+      body: JSON.stringify({ messages: msgs, stream: true }),
+    });
+    if (res.status === 401) { disconnectedByServer(); return; }
+    if (!res.ok) throw new Error((await res.json().catch(() => ({}))).detail || ("The computer answered " + res.status + "."));
+    const ct = res.headers.get("content-type") || "";
+    if (ct.includes("application/x-ndjson")) {
+      const reader = res.body.getReader();
+      const dec = new TextDecoder();
+      let buf = "";
+      for (;;) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        buf += dec.decode(value, { stream: true });
+        let nl;
+        while ((nl = buf.indexOf("\n")) >= 0) {
+          const line = buf.slice(0, nl).trim(); buf = buf.slice(nl + 1);
+          if (!line) continue;
+          const ev = JSON.parse(line);
+          if ("text" in ev) { acc += ev.text; bubble.classList.remove("empty"); bubble.innerHTML = renderMd(acc); scrollDown(); }
+          else if ("error" in ev) throw new Error(ev.error.detail || "The computer's model had a problem.");
+          else if ("result" in ev) { acc = ev.result?.choices?.[0]?.message?.content ?? acc; }
+        }
+        if (stopFlag) { reader.cancel(); break; }   // closing the stream stops the model
+      }
+    } else {
+      const j = await res.json();
+      acc = j?.choices?.[0]?.message?.content ?? "";
+    }
+    bubble.innerHTML = acc ? renderMd(acc) : "";
+    if (!acc) bubble.classList.add("empty");
+    if (acc) { S.history.push({ role: "assistant", content: acc }); store(); }
+  } catch (e) {
+    bubble.classList.remove("empty");
+    bubble.innerHTML = renderMd((acc ? acc + "\n\n" : "") + "⚠️ " + (e.message || "Something went wrong."));
+  } finally {
+    setSend("send");
+    scrollDown();
+  }
+}
+
+// --- menu ---
+function menu() {
+  const choice = prompt("Type:  new  — start a fresh chat\n       disconnect  — forget this computer", "");
+  if (choice === null) return;
+  const c = choice.trim().toLowerCase();
+  if (c === "new") { S.history = []; store(); renderHistory(); }
+  else if (c === "disconnect") {
+    S.token = null; S.history = []; store();
+    $("connect-sub").textContent = "Connect this device to your computer's model.";
+    show("connect");
+  }
+}
+
+// --- wire up ---
+$("dev-name").value = S.deviceName;
+$("connect-note").textContent =
+  "Your messages are encrypted and stay on your home network. This browser can't verify the computer's identity the way the desktop app does, so only connect on a network you trust.";
+$("connect-btn").addEventListener("click", connect);
+$("dev-name").addEventListener("keydown", (e) => { if (e.key === "Enter") connect(); });
+$("wait-cancel").addEventListener("click", () => { stopWaiting(); S.requestId = null; store(); show("connect"); });
+$("menu-btn").addEventListener("click", menu);
+$("send").addEventListener("click", () => { if (generating) { stopFlag = true; } else { send(); } });
+const input = $("input");
+input.addEventListener("input", () => { input.style.height = "auto"; input.style.height = Math.min(input.scrollHeight, 140) + "px"; });
+input.addEventListener("keydown", (e) => {
+  if (e.key === "Enter" && !e.shiftKey && !e.isComposing) { e.preventDefault(); if (!generating) send(); }
+});
+
+// --- start on the right screen ---
+if (S.token) openChat();
+else if (S.requestId) startWaiting();
+else show("connect");
+</script>
+</body>
+</html>

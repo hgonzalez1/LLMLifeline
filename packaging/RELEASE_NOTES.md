@@ -1,5 +1,11 @@
 A private AI chat and image generator that runs on your own computer. No cloud, no subscription, no account.
 
+## New in 1.3.7: use it from your phone or tablet
+
+- **Open LLMlifeline in your phone's browser.** Turn on **Share this computer's model** in the 🖧 Network panel, and it now shows a web address like `https://192.168.1.20:8100`. Type that into Safari or Chrome on any phone or tablet on your home WiFi, approve the device once on the computer, and you have a full chat with the computer's model — no app to install. iPhone, iPad and Android all work the same way.
+- **Your conversation stays on your phone.** As with every other connected device, only the model work travels to the computer; the chat itself lives in your phone's browser and nothing about it is saved on the computer. The connection is encrypted and answers only devices on your local network.
+- **One thing to expect:** the first time, the browser shows a "not private" security warning, because the computer proves its identity with a certificate the browser can't vouch for. Tap through it once — the traffic is still encrypted and never leaves your network. Only do this on a network you trust.
+
 ## New in 1.3.6: stop a reply while it's being written
 
 - **A Stop button.** While the assistant is writing, the Send button turns into a red **Stop**. Press it to halt the reply right away — it cuts the model off so your graphics card is freed immediately, not left running to the end out of sight. Whatever had been written stays on screen; it isn't saved, the same as closing the page mid-reply. Before, once a long reply started there was no way to interrupt it.

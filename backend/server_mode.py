@@ -45,13 +45,14 @@ import uuid
 from pathlib import Path
 
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 
 APP_ROOT = Path(__file__).resolve().parent.parent
 SERVER_DIR = APP_ROOT / "server"
 SETTINGS_FILE = SERVER_DIR / "server.json"
 CERT_FILE = SERVER_DIR / "cert.pem"
 KEY_FILE = SERVER_DIR / "key.pem"
+PHONE_PAGE = APP_ROOT / "frontend" / "phone.html"
 
 DEFAULT_PORT = 8100
 SERVICE_TYPE = "_llmlifeline._tcp.local."
@@ -466,6 +467,20 @@ class ServerMode:
                 return JSONResponse({"detail": "This server only answers devices on its local network."},
                                     status_code=403)
             return await call_next(request)
+
+        @app.get("/", response_class=HTMLResponse)
+        async def phone_page():
+            """The chat page a phone or tablet browser loads. It pairs and
+            chats over this same encrypted, local-network-only connection;
+            nothing it does is saved on this computer (see this file's top)."""
+            try:
+                return HTMLResponse(PHONE_PAGE.read_text(encoding="utf-8"))
+            except OSError:
+                return HTMLResponse(
+                    "<!doctype html><meta charset=utf-8><title>LLMlifeline</title>"
+                    "<p style='font-family:sans-serif;max-width:30em;margin:3em auto'>This LLMlifeline "
+                    "server is running, but its phone page is missing. Update the app on the computer "
+                    "to the latest version.</p>", status_code=500)
 
         @app.get("/v1/hello")
         async def hello():

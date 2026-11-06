@@ -2166,9 +2166,14 @@ function renderNetworkServerSettings() {
   if (s.error) box.append(h("div", { class: "perm-help", style: "color:#e57373" }, s.error));
   if (s.running) {
     const where = s.addresses.length ? s.addresses.map((a) => `${a}`).join(" or ") : "this computer's network address";
+    const phoneUrl = s.addresses.length ? `https://${s.addresses[0]}:${s.port}` : null;
     box.append(h("div", { class: "net-card" }, h("div", { class: "net-card-text" },
       h("div", {}, h("span", { class: "net-dot on" }), `Sharing as ${s.name}`),
-      h("div", { class: "net-sub" }, `Other computers connect to ${where}, port ${s.port}. If Windows asks whether to allow LLMlifeline on networks, allow private networks only.`))));
+      h("div", { class: "net-sub" }, `Other computers connect to ${where}, port ${s.port}. If Windows asks whether to allow LLMlifeline on networks, allow private networks only.`),
+      phoneUrl ? h("div", { class: "net-sub", style: "margin-top:6px" },
+        "📱 On a phone or tablet, open ",
+        h("span", { style: "font-family:Consolas,Menlo,monospace;color:var(--text)" }, phoneUrl),
+        " in its browser, then approve it here. Tap through the one-time security warning.") : null)));
   }
   box.append(
     h("label", { class: "net-check" },

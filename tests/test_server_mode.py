@@ -33,6 +33,8 @@ import remote_client  # noqa: E402
 remote_client.REMOTE_FILE = TMP / "remote.json"
 remote_client.reload()
 
+import httpx  # noqa: E402
+
 import main  # noqa: E402
 from fastapi.testclient import TestClient  # noqa: E402
 
@@ -135,6 +137,18 @@ def test_server_starts_with_its_own_certificate():
     status = main.server.status()
     assert status["running"], status["error"]
     assert server_mode.CERT_FILE.exists() and status["fingerprint"]
+
+
+def test_the_phone_page_is_served_over_the_gateway():
+    # A phone or tablet browser loads the chat page from the gateway itself,
+    # over the same pinned-certificate TLS the paired desktop client uses.
+    pem = server_mode.CERT_FILE.read_text(encoding="ascii")
+    with httpx.Client(verify=remote_client._pinned(pem), trust_env=False, timeout=10) as http:
+        response = http.get(f"https://127.0.0.1:{PORT}/")
+    assert response.status_code == 200, response.text
+    assert response.headers["content-type"].startswith("text/html")
+    assert "llmlifeline-phone" in response.text              # the page's own marker
+    assert "/v1/chat/completions" in response.text           # it chats through the gateway
 
 
 def test_pairing_needs_approval_and_matching_codes():
